@@ -14,39 +14,42 @@ This script processes texture files, upscales them, patches mip levels, and prep
 
 - Python 3.7+
 - [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (native or Python version)
-- PCSX2 (for texture dumping/loading)
+- [PCSX2](https://pcsx2.net/) (for texture dumping/loading)
 
 ## PCSX2 Setup
 
 1. **Enable Texture Dumping:**
-	- In PCSX2, go to `Config > Advanced > Texture Dumping` and enable it.
-	- Run your game; dumped textures will appear in the `dumps` folder.
+	- In PCSX2, go to `Settings > Graphics > Texture Replacement > Dump Textures` and enable it.
+	- Run your game; textures as they are loaded and rendered will appear in the `dumps` folder. 
 
 2. **Enable Texture Replacement:**
-	- In PCSX2, go to `Config > Advanced > Texture Replacement` and enable it.
-	- Place upscaled textures in the `replacements` folder.
+	- In PCSX2, go to `Settings > Graphics > Texture Replacement > Load Textures` and enable it.
+    - Enabling `Asynchronous Texture Loading` and `Precache Textures` is recommend to avoid slowdown and hitches, especially using Vulkan renderer
 
 ## Folder Structure
 
-- `dumps/` — original dumped textures from PCSX2
-- `intermediate/` — upscaled and patched textures (created by script, should be a sibling of `dumps` and `replacements`)
-- `replacements/` — final textures for PCSX2 to load
+Note: These folders are typically located in `C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\`
+- `dumps\` - original dumped textures from PCSX2
+- `intermediates\` - upscaled and patched textures (created by script, should be a sibling of `dumps` and `replacements`)
+- `replacements\` - final textures for PCSX2 to load
 
 ## Usage
 
 1. Install dependencies.
-2. Create an `intermediate` folder next to your `dumps` and `replacements` folders.
+2. Create an `intermediates` folder next to your `dumps` and `replacements` folders.
 3. Run the script:
 	```
-	python upscale.py -r <path_to_realesrgan> -i <path_to_dumps> -m <path_to_intermediate> -o <path_to_replacements>
+	python upscale.py -r <path_to_realesrgan> -i <path_to_dumps> -m <path_to_intermediates> -o <path_to_replacements>
 	```
 	- Example:
 	  ```
-	  python upscale.py -r realesrgan-ncnn-vulkan.exe -i dumps -m intermediate -o replacements
+	  python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -i "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\dumps" -m "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\intermediates" -o "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\replacements"
 	  ```
 	- You can pass extra arguments to Real-ESRGAN with `--realesrgan-args "<args>"`.
 
 4. The upscaled textures will be ready in the `replacements` folder for PCSX2.
+
+Note: This script and PCSX2 do not run continuously. As the game is played, more textures are dumped to disk and need to be upscaled. PCSX2 needs to have replacement textures manually refreshed. A hotkey can be bound in `Settings > Hotkeys` under `Graphics > Reload Texture Replacements`.
 
 ## License
 
