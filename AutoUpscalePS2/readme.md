@@ -5,24 +5,21 @@ Automatic batch upscaling & preparation of PlayStation 2 textures dumped from PC
 
 ---
 
-## 1. Quick Start
+## Quick Start
 
 ```powershell
 # Game folder mode (auto uses dumps/intermediates/replacements)
 python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -g "C:\Users\you\Documents\PCSX2\textures\<GAME_SERIAL>"
 
-# Add ID-based replacement & verbose timing
-python upscale.py -r <realesrgan> -g <game_path> --id-replace -vv
-
-# Dry run preview (no writes)
-python upscale.py -r <realesrgan> -g <game_path> --id-replace --dry-run -vv
+# Add ID-based replacement (recommended for LOD/distance quality improvement)
+python upscale.py -r <realesrgan> -g <game_path> --id-replace
 ```
 
 Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Load Textures" is enabled; use the hotkey to reload as needed).
 
 ---
 
-## 2. Core Features
+## Core Features
 
 | Area | What it does |
 |------|--------------|
@@ -34,7 +31,7 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 
 ---
 
-## 3. Requirements
+## Requirements
 
 * Python 3.7+
 * [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (native NCNN or Python script)
@@ -43,7 +40,7 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 
 ---
 
-## 4. PCSX2 Configuration
+## PCSX2 Configuration
 
 1. Enable dumping: `Settings > Graphics > Texture Replacement > Dump Textures`.
 2. Enable loading: `Settings > Graphics > Texture Replacement > Load Textures`.
@@ -52,7 +49,7 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 
 ---
 
-## 5. Folder Layout (Game Mode `-g`)
+## Folder Layout (Game Mode `-g`)
 
 Given `-g C:\...\textures\<GAME_SERIAL>`:
 
@@ -67,7 +64,7 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 
 ---
 
-## 6. Verbosity Levels
+## Verbosity Levels
 
 | Flag | Adds |
 |------|------|
@@ -79,7 +76,7 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 
 ---
 
-## 7. Command Overview (Main Script)
+## Command Overview (Main Script)
 
 | Flag | Purpose |
 |------|---------|
@@ -96,7 +93,7 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 
 ---
 
-## 8. ID-Based Small Texture Replacement
+## ID-Based Small Texture Replacement
 
 Many games embed alternate LOD texture variants instead of relying purely on mip chains. These often differ only by an internal numeric second segment in the filename (`prefix-<ID>-rest.png`). This feature consolidates smaller variants to the best matching larger one—only when they are visually similar.
 
@@ -120,7 +117,7 @@ python upscale.py -r <realesrgan> -g <game_path> --id-replace \
 
 ---
 
-## 9. Similarity Analysis Helper (`detect_similar_images.py`)
+## Similarity Analysis Helper (`detect_similar_images.py`)
 
 Use this separate tool to audit non-mip low-res textures that are near duplicates of higher-res bases (useful for manual cleanup or validating ID replacement).
 
@@ -159,7 +156,7 @@ Visual output (when using `--visual-dir`):
 
 ---
 
-## 10. Workflow Summary
+## Workflow Summary
 
 1. Play game to populate `dumps/`.
 2. Run upscale pipeline (optionally with `--id-replace`).
@@ -169,7 +166,7 @@ Visual output (when using `--visual-dir`):
 
 ---
 
-## 11. Troubleshooting
+## Troubleshooting
 
 | Symptom | Suggestion |
 |---------|------------|
@@ -181,19 +178,19 @@ Visual output (when using `--visual-dir`):
 
 ---
 
-## 12. Cheat Sheet
+## Cheat Sheet
 
 | Goal | Command (PowerShell) |
 |------|----------------------|
 | Basic upscale | `python upscale.py -r <realesrgan> -g <game>` |
-| Include ID replacement | `python upscale.py -r <realesrgan> -g <game> --id-replace -vv` |
-| Dry run preview | `python upscale.py -r <realesrgan> -g <game> --id-replace --dry-run -vv` |
+| Include ID replacement | `python upscale.py -r <realesrgan> -g <game> --id-replace` |
+| Dry run preview | `python upscale.py -r <realesrgan> -g <game> --id-replace --dry-run` |
 | Similarity audit (defaults) | `python detect_similar_images.py -g <game>` |
 | Similarity audit @256 base | `python detect_similar_images.py -g <game> --base-size 256` |
 | Visual gallery | `python detect_similar_images.py -g <game> --visual-dir visuals --hash-threshold 8` |
 
 ---
 
-## 13. License
+## License
 
 See [LICENSE](LICENSE) for details.
