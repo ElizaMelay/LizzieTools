@@ -58,7 +58,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show what would be done without making changes",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase output verbosity (can be specified multiple times, e.g. -vvv)",
+    )
     return parser.parse_args()
+def vprint(msg: str, level: int, verbosity: int):
+    if verbosity >= level:
+        print(msg)
 
 
 def discover_realesrgan_cmd(path: Path) -> List[str]:
@@ -96,7 +106,7 @@ def discover_realesrgan_cmd(path: Path) -> List[str]:
     return [str(tool)]
 
 
-def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, extra_args: str, dry_run: bool = False) -> int:
+def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, extra_args: str, dry_run: bool = False, verbosity: int = 0) -> int:
     """
     Attempt to run Real-ESRGAN once on the whole directory using -i/-o.
     Returns process return code (0 means success). If dry_run, returns 0.
@@ -108,23 +118,22 @@ def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, ext
     if extra_args:
         args += shlex.split(extra_args)
 
-    print(f"[Real-ESRGAN] Command: {' '.join(args)}")
+    vprint(f"[Real-ESRGAN] Command: {' '.join(args)}", 3, verbosity)
     if dry_run:
         return 0
-
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(proc.stdout)
+    vprint(proc.stdout, 3, verbosity)
     return proc.returncode
 
 
-def patch_mips_in_place(root: Path, dry_run: bool = False) -> None:
+def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0) -> None:
     """
     For files matching *-mipN*.{ext}, copy the highest mip (the file WITHOUT the -mip suffix)
     to all other mip levels in the same group.
     Grouping is based on file stem sans the -mipN part within each directory and extension.
     Only overwrites existing files; does not create new ones.
     """
-    print(f"[Mips] Patching mip levels under: {root}")
+    vprint(f"[Mips] Patching mip levels under: {root}", 2, verbosity)
 
     # Map[(dirpath, key, ext)] -> {mip_num: Path}
     groups: Dict[Tuple[Path, str, str], Dict[int, Path]] = {}
@@ -168,16 +177,20 @@ def patch_mips_in_place(root: Path, dry_run: bool = False) -> None:
         for mip, dst_path in mip_map.items():
             if src_path == dst_path:
                 continue
-            print(f"[Mips] Overwrite {dst_path.name} with {src_path.name}")
+            vprint(f"[Mips] Overwrite {dst_path.name} with {src_path.name}", 2, verbosity)
             total_overwrites += 1
             if not dry_run:
                 # Overwrite bytes
                 shutil.copyfile(src_path, dst_path)
-    print(f"[Mips] Patched {total_overwrites} files.")
+    if dry_run:
+        vprint(f"  Would have patched {total_overwrites} files (dry run, no changes made).", 1, verbosity)
+    else:
+        vprint(f"  Patched {total_overwrites} files.", 1, verbosity)
 
 
-def copy_tree(src: Path, dst: Path, dry_run: bool = False) -> None:
-    print(f"[Copy] Mirroring {src} -> {dst}")
+def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0) -> None:
+    vprint(f"[Copy] Mirroring {src} -> {dst}", 3, verbosity)
+    copied_count = 0
     for dirpath, dirnames, filenames in os.walk(src):
         rel = os.path.relpath(dirpath, src)
         out_dir = dst / rel if rel != "." else dst
@@ -186,13 +199,25 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False) -> None:
         for fn in filenames:
             src_file = Path(dirpath) / fn
             dst_file = out_dir / fn
-            print(f"[Copy] {src_file} -> {dst_file}")
+            vprint(f"[Copy] {src_file} -> {dst_file}", 3, verbosity)
             if not dry_run:
                 shutil.copy2(src_file, dst_file)
+            copied_count += 1
+    if dry_run:
+        vprint(f"  Would have copied {copied_count} files (dry run, no changes made).", 1, verbosity)
+    else:
+        vprint(f"  Copied {copied_count} files.", 1, verbosity)
 
 
 def main() -> None:
     args = parse_args()
+    verbosity = args.verbose
+
+    # Single banner line
+    if args.game:
+        print(f"Running AutoUpscalePS2 on {args.game}...")
+    else:
+        print(f"Running AutoUpscalePS2 on {args.input}...")
 
     # Check for mutually exclusive arguments
     if args.game:
@@ -211,6 +236,19 @@ def main() -> None:
         interm_dir = Path(args.intermediate).resolve()
         output_dir = Path(args.output).resolve()
 
+    # Initial echo of user request (under -v)
+    vprint("[Config] Requested upscaling operation:", 1, verbosity)
+    if args.game:
+        vprint(f"  Game texture folder: {args.game}", 1, verbosity)
+        vprint(f"  Input: {input_dir}\n  Intermediate: {interm_dir}\n  Output: {output_dir}", 1, verbosity)
+    else:
+        vprint(f"  Input: {input_dir}\n  Intermediate: {interm_dir}\n  Output: {output_dir}", 1, verbosity)
+    vprint(f"  Real-ESRGAN: {args.realesrgan}", 1, verbosity)
+    if args.realesrgan_args:
+        vprint(f"  Real-ESRGAN extra args: {args.realesrgan_args}", 1, verbosity)
+    if args.dry_run:
+        print("  Dry run: enabled (no changes will be made)")
+
     if not input_dir.exists() or not input_dir.is_dir():
         print(f"[Error] Input folder does not exist or is not a directory: {input_dir}")
         sys.exit(1)
@@ -219,27 +257,31 @@ def main() -> None:
         interm_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Run Real-ESRGAN
+    # Count input image files
+    input_files = []
+    for dirpath, _, filenames in os.walk(input_dir):
+        for fn in filenames:
+            ext = Path(fn).suffix.lower()
+            if ext in IMAGE_EXTS:
+                input_files.append(os.path.join(dirpath, fn))
+    vprint(f"[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
+    vprint(f"  Found {len(input_files)} input image files.", 1, verbosity)
     realesrgan_path = Path(args.realesrgan)
     cmd = discover_realesrgan_cmd(realesrgan_path)
-
-    print("[Step 1] Running Real-ESRGAN on input folder -> intermediate folder")
-    rc = run_realesrgan_on_dir(cmd, input_dir, interm_dir, args.realesrgan_args, dry_run=args.dry_run)
+    rc = run_realesrgan_on_dir(cmd, input_dir, interm_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
     if rc != 0:
         print(
             "[Warning] Real-ESRGAN returned a non-zero exit code. Check the command and paths."
         )
         sys.exit(rc)
 
-    # Step 2: Patch mip levels
-    print("[Step 2] Patching mip levels in intermediate folder")
-    patch_mips_in_place(interm_dir, dry_run=args.dry_run)
+    vprint("[Step 2] Patching mip levels in intermediate folder", 1, verbosity)
+    patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity)
 
-    # Step 3: Copy to final output
-    print("[Step 3] Copying upscaled textures to final output folder")
-    copy_tree(interm_dir, output_dir, dry_run=args.dry_run)
+    vprint("[Step 3] Copying upscaled textures to final output folder", 1, verbosity)
+    copy_tree(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity)
 
-    print("[Done] Upscaling pipeline completed.")
+    vprint("[Done] Upscaling pipeline completed.", 0, verbosity)
 
 
 if __name__ == "__main__":

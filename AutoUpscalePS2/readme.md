@@ -36,6 +36,10 @@ When using the `-g`/`--game` argument, simply specify the path to your PCSX2 gam
 
 These folders are not required to be created manually (except for `dumps`, which is created by PCSX2 when dumping textures). The script will create `intermediates` and `replacements` as needed. This structure is typical for PCSX2 texture workflows, but you can also specify custom paths using the original arguments if desired.
 
+## Verbosity
+
+You can control how much output the script prints using the `-v`/`--verbose` flag. Add more `v`s for more detail (e.g., `-v`, `-vv`, `-vvv`). The default is minimal output; higher levels show more information about the upscaling process, mip patching, and file copying.
+
 ## Usage
 
 1. Install dependencies.
