@@ -315,14 +315,44 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
       1. Scan all image files in root recursively.
       2. For each file whose stem contains at least two dashes, take segment[1] as group key.
       3. Within each group decide a canonical large image (largest area; tie -> first encountered).
-      4. For each small image in group (and not itself the chosen large) copy large over small.
-    Returns number of replacements performed.
+      4. For each small image in group (and not itself the chosen large) compute similarity to the
+         canonical large using perceptual average-hash (aHash). Only replace if Hamming distance
+         <= SIM_HASH_THRESHOLD (hard‑coded) after scaling logic (hash is size invariant).
+    Returns number of replacements performed (post similarity filter).
     """
     try:
         from PIL import Image  # type: ignore
     except ImportError:
         print("[IDReplace][Error] Pillow not installed; cannot inspect image sizes. Skipping.")
         return 0
+
+    # Hash parameters (chosen to mirror detect_similar_images defaults but fixed to keep CLI simple)
+    SIM_HASH_SIZE = 8  # 8x8 -> 64 bits
+    SIM_HASH_THRESHOLD = 6  # Max Hamming distance to treat as similar
+
+    def compute_ahash(path: Path) -> Optional[int]:
+        """Compute an average hash (aHash) for similarity gating. Returns 64-bit int or None on failure."""
+        try:
+            with Image.open(path) as im:
+                im = im.convert("L")
+                im_small = im.resize((SIM_HASH_SIZE, SIM_HASH_SIZE), Image.Resampling.LANCZOS)
+                pixels = list(im_small.getdata())
+                mean_val = sum(pixels) / len(pixels)
+                bits = 0
+                for i, px in enumerate(pixels):
+                    if px >= mean_val:
+                        bits |= 1 << i
+                return bits
+        except OSError as e:
+            msg = f"[IDReplace][Warn] Cannot hash {path}: {e}"
+            if verbosity >= 3:
+                print(msg)
+            if errors is not None:
+                errors.append(msg)
+            return None
+
+    def hamming(a: int, b: int) -> int:
+        return (a ^ b).bit_count()
 
     vprint(f"[IDReplace] Scanning for candidate textures under {root}", 2, verbosity)
     groups: Dict[str, List[Tuple[Path, int, int]]] = {}
@@ -354,6 +384,7 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
             groups.setdefault(key, []).append((full_path, w, h))
 
     replacements = 0
+    similarity_skips = 0
     for key, items in groups.items():
         # Partition into large and small based on thresholds
         large_items = [it for it in items if max(it[1], it[2]) >= large_thresh]
@@ -364,11 +395,26 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
         large_items.sort(key=lambda t: (-(t[1] * t[2]), -max(t[1], t[2])))
         canonical = large_items[0]
         canon_path, cw, ch = canonical[0], canonical[1], canonical[2]
+        canon_hash = compute_ahash(canon_path)
+        if canon_hash is None:
+            # Cannot compute hash; skip whole group for safety
+            if verbosity >= 2:
+                print(f"[IDReplace] Skipping group key={key} (failed to hash canonical {canon_path.name})")
+            continue
         for small_path, sw, sh in small_items:
             if small_path == canon_path:
                 continue
+            small_hash = compute_ahash(small_path)
+            if small_hash is None:
+                continue
+            dist = hamming(canon_hash, small_hash)
+            if dist > SIM_HASH_THRESHOLD:
+                similarity_skips += 1
+                if verbosity >= 3:
+                    print(f"[IDReplace] Skip (not similar) {small_path.name} vs {canon_path.name} hamming={dist} > {SIM_HASH_THRESHOLD}")
+                continue
             vprint(
-                f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {canon_path.name} ({cw}x{ch}) [key={key}]",
+                f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {canon_path.name} ({cw}x{ch}) [key={key}] hamming={dist}",
                 2,
                 verbosity,
             )
@@ -390,9 +436,9 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
             replacements += 1
 
     if dry_run:
-        vprint(f"[IDReplace] Would have replaced {replacements} small textures (dry run).", 1, verbosity)
+        vprint(f"[IDReplace] Would have replaced {replacements} small textures (dry run). Similarity skips: {similarity_skips}", 1, verbosity)
     else:
-        vprint(f"[IDReplace] Replaced {replacements} small textures.", 1, verbosity)
+        vprint(f"[IDReplace] Replaced {replacements} small textures. Similarity skips: {similarity_skips}", 1, verbosity)
     return replacements
 
 
