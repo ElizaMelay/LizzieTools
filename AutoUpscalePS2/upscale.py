@@ -35,13 +35,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "-i", "--input", required=True, help="Path to dumped textures input folder"
+        "-i", "--input", required=False, help="Path to dumped textures input folder"
     )
     parser.add_argument(
-        "-m", "--intermediate", required=True, help="Path to intermediate folder"
+        "-m", "--intermediate", required=False, help="Path to intermediate folder"
     )
     parser.add_argument(
-        "-o", "--output", required=True, help="Path to final output folder"
+        "-o", "--output", required=False, help="Path to final output folder"
+    )
+    parser.add_argument(
+        "-g", "--game", required=False, help="Path to PCSX2 game texture folder (sets input/intermediate/output automatically)"
     )
     parser.add_argument(
         "--realesrgan-args",
@@ -191,9 +194,22 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False) -> None:
 def main() -> None:
     args = parse_args()
 
-    input_dir = Path(args.input).resolve()
-    interm_dir = Path(args.intermediate).resolve()
-    output_dir = Path(args.output).resolve()
+    # Check for mutually exclusive arguments
+    if args.game:
+        if args.input or args.intermediate or args.output:
+            print("[Error] Cannot use -g/--game with -i/--input, -m/--intermediate, or -o/--output.")
+            sys.exit(1)
+        base = Path(args.game).resolve()
+        input_dir = base / "dumps"
+        interm_dir = base / "intermediates"
+        output_dir = base / "replacements"
+    else:
+        if not (args.input and args.intermediate and args.output):
+            print("[Error] Must specify either -g/--game or all of -i/--input, -m/--intermediate, -o/--output.")
+            sys.exit(1)
+        input_dir = Path(args.input).resolve()
+        interm_dir = Path(args.intermediate).resolve()
+        output_dir = Path(args.output).resolve()
 
     if not input_dir.exists() or not input_dir.is_dir():
         print(f"[Error] Input folder does not exist or is not a directory: {input_dir}")

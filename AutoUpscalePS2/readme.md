@@ -28,10 +28,13 @@ This script processes texture files, upscales them, patches mip levels, and prep
 
 ## Folder Structure
 
-Note: These folders are typically located in `C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\`
-- `dumps\` - original dumped textures from PCSX2
-- `intermediates\` - upscaled and patched textures (created by script, should be a sibling of `dumps` and `replacements`)
-- `replacements\` - final textures for PCSX2 to load
+When using the `-g`/`--game` argument, simply specify the path to your PCSX2 game texture folder (for example, `C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>`). The script will automatically look for and use the following subfolders:
+
+- `dumps\` — Contains the original textures dumped by PCSX2 as you play the game.
+- `intermediates\` — Used by the script to store upscaled and patched textures (created automatically if it doesn't exist).
+- `replacements\` — Where the final upscaled textures are placed for PCSX2 to load as replacements.
+
+These folders are not required to be created manually (except for `dumps`, which is created by PCSX2 when dumping textures). The script will create `intermediates` and `replacements` as needed. This structure is typical for PCSX2 texture workflows, but you can also specify custom paths using the original arguments if desired.
 
 ## Usage
 
@@ -39,11 +42,11 @@ Note: These folders are typically located in `C:\Users\username\Documents\PCSX2\
 2. Create an `intermediates` folder next to your `dumps` and `replacements` folders.
 3. Run the script:
 	```
-	python upscale.py -r <path_to_realesrgan> -i <path_to_dumps> -m <path_to_intermediates> -o <path_to_replacements>
+	python upscale.py -r <path_to_realesrgan> -g <path_to_game_textures>
 	```
 	- Example:
 	  ```
-	  python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -i "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\dumps" -m "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\intermediates" -o "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\replacements"
+	  python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -g "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>"
 	  ```
 	- You can pass extra arguments to Real-ESRGAN with `--realesrgan-args "<args>"`.
 
