@@ -65,6 +65,26 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Increase output verbosity (can be specified multiple times, e.g. -vvv)",
     )
+    # ID-based small->large replacement feature
+    parser.add_argument(
+        "--id-replace",
+        action="store_true",
+        help=(
+            "Enable replacement of small textures with larger ones sharing the same second ID segment (between first and second dashes)."
+        ),
+    )
+    parser.add_argument(
+        "--id-small-threshold",
+        type=int,
+        default=256,
+        help="Max dimension below which a texture is considered SMALL for ID-based replacement (default 256)",
+    )
+    parser.add_argument(
+        "--id-large-threshold",
+        type=int,
+        default=256,
+        help="Min dimension at or above which a texture is considered LARGE for ID-based replacement (default 256)",
+    )
     return parser.parse_args()
 
 def vprint(msg: str, level: int, verbosity: int):
@@ -287,6 +307,95 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, e
     return copied_count
 
 
+def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
+    """Replace small textures (< small_thresh) with a large texture (>= large_thresh) when they share
+    the same second ID segment (filename stem split by '-'). Only considers non-mip files.
+
+    Strategy:
+      1. Scan all image files in root recursively.
+      2. For each file whose stem contains at least two dashes, take segment[1] as group key.
+      3. Within each group decide a canonical large image (largest area; tie -> first encountered).
+      4. For each small image in group (and not itself the chosen large) copy large over small.
+    Returns number of replacements performed.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        print("[IDReplace][Error] Pillow not installed; cannot inspect image sizes. Skipping.")
+        return 0
+
+    vprint(f"[IDReplace] Scanning for candidate textures under {root}", 2, verbosity)
+    groups: Dict[str, List[Tuple[Path, int, int]]] = {}
+    # Collect files
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            ext = Path(fn).suffix.lower()
+            if ext not in IMAGE_EXTS:
+                continue
+            stem = Path(fn).stem
+            # Skip mip variants
+            if MIP_REGEX.match(stem):
+                continue
+            parts = stem.split('-')
+            if len(parts) < 3:
+                continue  # not in expected pattern
+            key = parts[1]
+            full_path = Path(dirpath) / fn
+            try:
+                with Image.open(full_path) as im:
+                    w, h = im.size
+            except OSError as e:
+                msg = f"[IDReplace][Warn] Cannot open {full_path}: {e}"
+                if verbosity >= 3:
+                    print(msg)
+                if errors is not None:
+                    errors.append(msg)
+                continue
+            groups.setdefault(key, []).append((full_path, w, h))
+
+    replacements = 0
+    for key, items in groups.items():
+        # Partition into large and small based on thresholds
+        large_items = [it for it in items if max(it[1], it[2]) >= large_thresh]
+        small_items = [it for it in items if max(it[1], it[2]) < small_thresh]
+        if not large_items or not small_items:
+            continue
+        # Choose canonical large: largest area
+        large_items.sort(key=lambda t: (-(t[1] * t[2]), -max(t[1], t[2])))
+        canonical = large_items[0]
+        canon_path, cw, ch = canonical[0], canonical[1], canonical[2]
+        for small_path, sw, sh in small_items:
+            if small_path == canon_path:
+                continue
+            vprint(
+                f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {canon_path.name} ({cw}x{ch}) [key={key}]",
+                2,
+                verbosity,
+            )
+            if not dry_run:
+                try:
+                    shutil.copy2(canon_path, small_path)
+                except PermissionError:
+                    msg = f"[IDReplace][Error] Permission denied overwriting {small_path}"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
+                except OSError as e:
+                    msg = f"[IDReplace][Error] Failed to overwrite {small_path}: {e.strerror or e}"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
+            replacements += 1
+
+    if dry_run:
+        vprint(f"[IDReplace] Would have replaced {replacements} small textures (dry run).", 1, verbosity)
+    else:
+        vprint(f"[IDReplace] Replaced {replacements} small textures.", 1, verbosity)
+    return replacements
+
+
 def main() -> None:
     args = parse_args()
     verbosity = args.verbose
@@ -396,9 +505,21 @@ def main() -> None:
         sys.exit(rc)
     t_step1_end = perf_counter()
 
-    vprint("[Step 2] Patching mip levels in intermediate folder", 1, verbosity)
+    vprint("[Step 2] ID-based small texture replacement & mip patching", 1, verbosity)
     t_step2 = perf_counter()
     errors: List[str] = []
+    id_replacements = 0
+    if args.id_replace:
+        vprint("[Step 2] ID-based small texture replacement (pre-mip patch)", 2, verbosity)
+        id_replacements = replace_small_id_variants(
+            interm_dir,
+            args.id_small_threshold,
+            args.id_large_threshold,
+            dry_run=args.dry_run,
+            verbosity=verbosity,
+            errors=errors,
+        )
+    vprint("[Step 2] Patching mip levels in intermediate folder", 2, verbosity)
     mips_patched = patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
     t_step2_end = perf_counter()
 
@@ -419,7 +540,10 @@ def main() -> None:
             step3_time = t_step3_end - t_step3
             if input_files:
                 print(f"  Input images: {len(input_files)} - upscaled in {step1_time:.2f}s")
-            print(f"  Mips patched: {mips_patched} - processed in {step2_time:.2f}s")
+            if args.id_replace:
+                print(f"  Mips patched: {mips_patched} (ID replacements: {id_replacements}) - processed in {step2_time:.2f}s")
+            else:
+                print(f"  Mips patched: {mips_patched} - processed in {step2_time:.2f}s")
             print(f"  Files copied: {files_copied} - completed in {step3_time:.2f}s")
             print(f"  Total elapsed: {total_elapsed:.2f}s")
             if errors:
