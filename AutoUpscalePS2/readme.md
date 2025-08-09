@@ -84,6 +84,37 @@ Key options:
 
 Use the report to decide whether to remove / alias / copy the higher resolution texture over the low one for consistency.
 
+### Advanced options
+
+Additional tuning / inspection flags in `detect_similar_images.py`:
+
+- `--pair A B` : Directly compare two specific images (prints hash distance and optional diff) without scanning directories.
+- `--top-k K` : For each low-res texture, list the K closest high-res candidates (ignores the hash threshold for listing; threshold still governs match list).
+- `--limit N` : Only process the first N low-res textures (after sorting) for faster experimentation.
+- `--visual-dir VIS` : Generate visual composites (side-by-side + diff heatmap) for each match into a folder named `VIS` placed alongside the `intermediates` folder if `VIS` is a relative path. An `index.html` gallery is also generated unless `--no-html` is specified.
+- `--no-html` : Skip creating the HTML gallery (still writes composite PNGs).
+- `--csv file.csv` : Write match data to CSV.
+
+Example with visuals and gallery (will create a sibling folder to `intermediates`):
+```
+python detect_similar_images.py -g "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>" \
+	--base-size 256 --hash-threshold 8 --verify-diff --diff-threshold 15 \
+	--top-k 5 --visual-dir visuals --csv matches.csv
+```
+
+The composite image layout:
+- Left: Low-res texture scaled to high size (nearest) showing original pixel structure
+- Middle: High-res candidate
+- Right: Red heatmap (intensity represents per-pixel difference)
+
+Hash distance guidance (aHash 8x8):
+- 0–4: Very similar / near-identical overall tone & structure
+- 5–10: Similar with some changes (details, color variations)
+- 11–20: Possibly related but diverging
+- 21+: Usually unrelated
+
+Lower `--hash-size` makes the hash coarser and more tolerant to small changes; higher sizes increase discrimination but may inflate distances for minor variations.
+
 ## License
 
 See [LICENSE](LICENSE) for details.

@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
 	p.add_argument("--verify-diff", action="store_true", help="After hash match (and for --top-k), compute mean absolute pixel diff to confirm")
 	p.add_argument("--diff-threshold", type=float, default=12.0, help="Mean absolute difference (0-255) threshold if --verify-diff (default 12.0)")
 	p.add_argument("--csv", help="Optional path to write matches as CSV")
+	p.add_argument("--visual-dir", help="Directory to write visual comparison images (composite + diff heatmap) and gallery HTML")
+	p.add_argument("--no-html", action="store_true", help="When used with --visual-dir, skip generating HTML gallery (only images)")
 	p.add_argument("--limit", type=int, help="Optional limit on number of low-res textures to process")
 	p.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (-v, -vv)")
 	args = p.parse_args()
@@ -149,6 +151,70 @@ def mean_abs_diff_resized(low_path: Path, high_path: Path) -> float:
 		for (r1, g1, b1), (r2, g2, b2) in zip(low_px, high_px):
 			total += abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
 		return total / (len(low_px) * 3)
+
+
+def create_visual_composite(low_path: Path, high_path: Path, out_dir: Path, hash_dist: int, diff_val: Optional[float], hash_size: int) -> Path:
+	"""Create a side-by-side composite and diff heatmap for visual verification.
+
+	Layout (horizontal): [Low->High sized copy] | [High] | [Diff heatmap]
+	Returns path to saved composite PNG.
+	"""
+	from PIL import ImageDraw, ImageFont
+
+	with Image.open(low_path) as low_im, Image.open(high_path) as high_im:
+		# Ensure RGB
+		low_rgb = low_im.convert("RGB")
+		high_rgb = high_im.convert("RGB")
+		# Scale low to high size (bicubic for smoother comparison separately; nearest to illustrate original pixelation)
+		low_scaled_nn = low_rgb.resize(high_rgb.size, Image.Resampling.NEAREST)
+		low_scaled_bc = low_rgb.resize(high_rgb.size, Image.Resampling.BICUBIC)
+		# Diff heatmap (grayscale -> pseudo color red)
+		low_px = list(low_scaled_bc.getdata())
+		high_px = list(high_rgb.getdata())
+		assert len(low_px) == len(high_px)
+		# Build single-channel difference magnitude
+		diff_vals = []
+		for (r1,g1,b1),(r2,g2,b2) in zip(low_px, high_px):
+			m = (abs(r1-r2) + abs(g1-g2) + abs(b1-b2)) / 3  # 0..255
+			diff_vals.append(int(m))
+		# Create heatmap using red intensity; could map further but keep simple
+		heat = Image.new('RGB', high_rgb.size)
+		heat.putdata([(v,0,0) for v in diff_vals])
+
+		# Assemble composite
+		pad = 8
+		w_single, h_single = high_rgb.size
+		comp_w = w_single * 3 + pad * 4
+		comp_h = h_single + pad * 2 + 80  # room for caption
+		comp = Image.new('RGB', (comp_w, comp_h), (30,30,30))
+		x = pad
+		comp.paste(low_scaled_nn, (x, pad)); x += w_single + pad
+		comp.paste(high_rgb, (x, pad)); x += w_single + pad
+		comp.paste(heat, (x, pad))
+
+		# Caption text
+		draw = ImageDraw.Draw(comp)
+		caption = f"LOW:{low_im.width}x{low_im.height} -> HIGH:{high_im.width}x{high_im.height} | hash={hash_dist} hs={hash_size}"
+		if diff_val is not None:
+			caption += f" diff={diff_val:.2f}"
+		caption2 = f"Left: Low (nearest)  Middle: High  Right: Diff heatmap (red intensity)"
+		# Try a default font; fallback to basic
+		try:
+			font = ImageFont.load_default()
+		except Exception:
+			font = None
+		draw.text((pad, h_single + pad), caption, fill=(220,220,220), font=font)
+		draw.text((pad, h_single + pad + 20), caption2, fill=(180,180,180), font=font)
+
+		# Safe filename
+		base_name = f"{low_path.stem}__VS__{high_path.stem}.png"
+		# Truncate if overly long
+		if len(base_name) > 180:
+			base_name = base_name[:180] + '.png'
+		out_path = out_dir / base_name
+		out_path.parent.mkdir(parents=True, exist_ok=True)
+		comp.save(out_path)
+		return out_path
 
 
 def classify(images: Sequence[ImgInfo], base_size: int) -> Tuple[List[ImgInfo], List[ImgInfo]]:
@@ -307,6 +373,48 @@ def main() -> None:
 			for li, hi, dist, diff_val in matches:
 				w.writerow([li.path.name, li.width, li.height, hi.path.name, hi.width, hi.height, dist, f"{diff_val:.3f}" if diff_val is not None else ""])    
 		print(f"[Write] CSV report: {csv_path}")
+
+	# Visual composites
+	if args.visual_dir and matches:
+		vdir = Path(args.visual_dir)
+		# If relative, place alongside the intermediates directory (root's parent)
+		if not vdir.is_absolute():
+			# 'root' is the intermediates directory path used earlier
+			try:
+				parent_base = root.parent  # type: ignore[name-defined]
+			except NameError:
+				parent_base = Path.cwd()
+			vdir = parent_base / vdir
+		vdir.mkdir(parents=True, exist_ok=True)
+		print(f"[Visual] Generating composites in: {vdir}")
+		visual_entries = []  # (rel_path, low_name, high_name, dist, diff)
+		for li, hi, dist, diff_val in matches:
+			try:
+				comp_path = create_visual_composite(li.path, hi.path, vdir, dist, diff_val, args.hash_size)
+				visual_entries.append((comp_path.name, li.path.name, hi.path.name, dist, diff_val))
+			except OSError as e:
+				print(f"[Warn] Visual composite failed for {li.path.name}: {e}")
+		if visual_entries and not args.no_html:
+			index_path = vdir / "index.html"
+			with index_path.open('w', encoding='utf-8') as f:
+				f.write("<html><head><meta charset='utf-8'><title>Similar Texture Comparisons</title>"\
+					"<style>body{background:#1e1e1e;color:#ddd;font-family:Segoe UI,Arial,sans-serif;}"\
+					".grid{display:flex;flex-wrap:wrap;gap:16px;} .item{background:#2c2c2c;padding:8px;border-radius:6px;max-width:520px;}"\
+					"img{max-width:100%;height:auto;display:block;border:1px solid #444;}"\
+					".meta{font-size:12px;margin-top:4px;}</style></head><body>\n")
+				f.write(f"<h1>Similar Texture Comparisons ({len(visual_entries)})</h1>\n")
+				f.write("<div class='grid'>\n")
+				for name, low_name, high_name, dist, diff_val in visual_entries:
+					f.write("<div class='item'>\n")
+					f.write(f"<div class='meta'><strong>Low:</strong> {low_name}<br><strong>High:</strong> {high_name}<br>")
+					f.write(f"Hash distance: {dist} | Hash size: {args.hash_size}")
+					if diff_val is not None:
+						f.write(f" | Diff: {diff_val:.2f}")
+					f.write("</div>\n")
+					f.write(f"<img loading='lazy' src='{name}' alt='Composite {low_name} vs {high_name}' />\n")
+					f.write("</div>\n")
+				f.write("</div></body></html>")
+			print(f"[Visual] HTML gallery: {index_path}")
 
 	print(f"[Summary] Matches: {len(matches)} (hash threshold {args.hash_threshold}, diff verify: {args.verify_diff})")
 
