@@ -19,6 +19,15 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp"}
 MIP_REGEX = re.compile(r"^(?P<prefix>.*)-mip(?P<mip>\d+)(?P<suffix>.*)$", re.IGNORECASE)
 
 
+def is_eligible_filename(stem: str) -> bool:
+    """Return True if the texture filename stem has at least two dashes (>=3 segments).
+
+    Requirement: We now ignore files that have fewer than two dashes in *all* pipeline stages.
+    This keeps only names consistent with the expected ID pattern (prefix-ID-suffix...).
+    """
+    return stem.count('-') >= 2
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -332,9 +341,9 @@ def replace_small_id_variants(
     """Replace small textures (< small_thresh) with a large texture (>= large_thresh) when they share
     the same second ID segment (filename stem split by '-'). Only considers non-mip files.
 
-    Strategy:
-      1. Scan all image files in root recursively.
-      2. For each file whose stem contains at least two dashes, take segment[1] as group key.
+        Strategy:
+            1. Scan all image files in root recursively.
+            2. Only consider stems containing at least TWO dashes (i.e. three or more segments when split by '-'). Take segment[1] as group key.
       3. Within each group decide a canonical large image (largest area; tie -> first encountered).
       4. For each small image in group (and not itself the chosen large) compute similarity to the
          canonical large using perceptual average-hash (aHash). Only replace if Hamming distance
@@ -395,9 +404,12 @@ def replace_small_id_variants(
             # Skip mip variants
             if MIP_REGEX.match(stem):
                 continue
-            parts = stem.split('-')
-            if len(parts) < 3:
-                continue  # not in expected pattern
+            # Require at least two dashes in the stem (three segments) so we have a stable middle ID segment.
+            if stem.count('-') < 2:
+                if verbosity >= 4:
+                    print(f"[IDReplace][SkipDash] {stem} (needs >=2 dashes)")
+                continue
+            parts = stem.split('-')  # now guaranteed len(parts) >= 3
             key = parts[1]
             full_path = Path(dirpath) / fn
             try:
@@ -574,33 +586,74 @@ def main() -> None:
     if not check_writable(interm_dir) or not check_writable(output_dir):
         sys.exit(2)
 
-    # Optionally enumerate input files only if verbosity or dry_run (performance win for default quiet mode)
-    input_files: List[str] = []
-    if verbosity >= 1 or args.dry_run:
-        for dirpath, _, filenames in os.walk(input_dir):
-            for fn in filenames:
-                ext = Path(fn).suffix.lower()
-                if ext in IMAGE_EXTS:
-                    input_files.append(os.path.join(dirpath, fn))
-        vprint(f"[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
-        vprint(f"  Found {len(input_files)} input image files.", 1, verbosity)
-        if len(input_files) == 0:
-            print("[Info] No input images found. Nothing to do.")
-            return
-    else:
-        vprint("[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
+    # Step 1A: Filter + copy eligible images (>=2 dashes) to intermediate first
+    vprint("[Step 1] Filtering & copying eligible textures (>=2 dashes) to intermediate", 1, verbosity)
+    eligible_files: List[Path] = []
+    skipped_dash = 0
+    for dirpath, _, filenames in os.walk(input_dir):
+        rel_dir = os.path.relpath(dirpath, input_dir)
+        for fn in filenames:
+            src_path = Path(dirpath) / fn
+            ext = src_path.suffix.lower()
+            if ext not in IMAGE_EXTS:
+                continue
+            stem = src_path.stem
+            if not is_eligible_filename(stem):
+                skipped_dash += 1
+                continue
+            eligible_files.append(src_path)
+            if not args.dry_run:
+                out_dir = interm_dir / (rel_dir if rel_dir != '.' else '')
+                out_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(src_path, out_dir / fn)
+                except OSError as e:
+                    msg = f"[Error] Failed to copy eligible file {src_path} -> {out_dir / fn}: {e.strerror or e}"
+                    print(msg)
+                    continue
+            if verbosity >= 3:
+                vprint(f"[Filter] Keep {src_path}", 3, verbosity)
+    if not eligible_files:
+        print("[Info] No eligible input images (need >=2 dashes in name). Nothing to do.")
+        return
+    vprint(f"  Eligible images: {len(eligible_files)} (skipped for dash rule: {skipped_dash})", 1, verbosity)
+
+    # Step 1B: Upscale the intermediate folder into a temp dir, then merge back
+    temp_up_dir = interm_dir.parent / (interm_dir.name + "_upscaled_tmp")
+    if not args.dry_run:
+        if temp_up_dir.exists():
+            # Clean stale temp
+            shutil.rmtree(temp_up_dir)
+        temp_up_dir.mkdir(parents=True, exist_ok=True)
 
     t_step1 = perf_counter()
-    realesrgan_path = Path(args.realesrgan)
-    # Resolve path for clearer logging
-    realesrgan_path = realesrgan_path.resolve()
+    realesrgan_path = Path(args.realesrgan).resolve()
     cmd = discover_realesrgan_cmd(realesrgan_path)
     if verbosity >= 2:
         vprint(f"[Discover] Using Real-ESRGAN command: {' '.join(cmd)}", 2, verbosity)
-    rc = run_realesrgan_on_dir(cmd, input_dir, interm_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
+    # Run ESRGAN: input=interm_dir (filtered copies), output=temp_up_dir
+    rc = run_realesrgan_on_dir(cmd, interm_dir, temp_up_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
     if rc != 0:
         print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
+        # Clean temp if created
+        if not args.dry_run and temp_up_dir.exists():
+            shutil.rmtree(temp_up_dir, ignore_errors=True)
         sys.exit(rc)
+    # Merge upscaled results back into interm_dir
+    if not args.dry_run:
+        for dirpath, _, filenames in os.walk(temp_up_dir):
+            rel = os.path.relpath(dirpath, temp_up_dir)
+            target_dir = interm_dir / (rel if rel != '.' else '')
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for fn in filenames:
+                src_f = Path(dirpath) / fn
+                dst_f = target_dir / fn
+                try:
+                    shutil.move(str(src_f), str(dst_f))
+                except OSError as e:
+                    print(f"[Error] Failed moving upscaled {src_f} -> {dst_f}: {e.strerror or e}")
+        # Remove empty temp dir
+        shutil.rmtree(temp_up_dir, ignore_errors=True)
     t_step1_end = perf_counter()
 
     vprint("[Step 2] ID-based small texture replacement & mip patching", 1, verbosity)
@@ -638,8 +691,7 @@ def main() -> None:
             step1_time = t_step1_end - t_step1
             step2_time = t_step2_end - t_step2
             step3_time = t_step3_end - t_step3
-            if input_files:
-                print(f"  Input images: {len(input_files)} - upscaled in {step1_time:.2f}s")
+            print(f"  Eligible input images: {len(eligible_files)} - upscaled in {step1_time:.2f}s")
             if args.id_replace:
                 print(f"  Mips patched: {mips_patched} (ID replacements: {id_replacements}) - processed in {step2_time:.2f}s")
             else:
