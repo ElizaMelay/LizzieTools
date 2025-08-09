@@ -121,8 +121,25 @@ def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, ext
     vprint(f"[Real-ESRGAN] Command: {' '.join(args)}", 3, verbosity)
     if dry_run:
         return 0
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     vprint(proc.stdout, 3, verbosity)
+
+    error_lines = []
+    error_keywords = ["error", "failed", "invalid", "exception", "unable", "not found", "denied"]
+
+    if proc.stderr:
+        for line in proc.stderr.splitlines():
+            line_stripped = line.strip()
+            # Check for error keywords only
+            if any(kw in line_stripped.lower() for kw in error_keywords):
+                error_lines.append(line)
+
+    if error_lines:
+        print("[Error] Real-ESRGAN reported the following error output:")
+        for err in error_lines:
+            print(err)
+        return 1
+
     return proc.returncode
 
 
@@ -228,6 +245,10 @@ def main() -> None:
         input_dir = base / "dumps"
         interm_dir = base / "intermediates"
         output_dir = base / "replacements"
+        # Sanity check: game folder must contain 'dumps' subfolder
+        if not input_dir.exists() or not input_dir.is_dir():
+            print(f"[Error] The specified game texture folder does not contain a 'dumps' subfolder: {input_dir}")
+            sys.exit(1)
     else:
         if not (args.input and args.intermediate and args.output):
             print("[Error] Must specify either -g/--game or all of -i/--input, -m/--intermediate, -o/--output.")
@@ -270,9 +291,7 @@ def main() -> None:
     cmd = discover_realesrgan_cmd(realesrgan_path)
     rc = run_realesrgan_on_dir(cmd, input_dir, interm_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
     if rc != 0:
-        print(
-            "[Warning] Real-ESRGAN returned a non-zero exit code. Check the command and paths."
-        )
+        print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
         sys.exit(rc)
 
     vprint("[Step 2] Patching mip levels in intermediate folder", 1, verbosity)
