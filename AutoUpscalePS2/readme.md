@@ -1,120 +1,199 @@
 
 # AutoUpscalePS2
 
-A Python tool for automatically upscaling PlayStation 2 game textures dumped from PCSX2 using [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN).
-This script processes texture files, upscales them, patches mip levels, and prepares them for re-injection.
+Automatic batch upscaling & preparation of PlayStation 2 textures dumped from PCSX2 using [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN). Handles: upscale → optional small/large variant consolidation → mip patching → final replacement folder. Includes a companion similarity analysis tool for low‑resolution LOD duplicates.
 
-## Features
+---
 
-- Batch upscale PS2 textures (4x by default via Real-ESRGAN)
-- Uses highest mip level for all mip levels in textures with mips
-- Automates upscaling, mip patching, and copying to output
-- Detects similar standalone low‑resolution LOD textures (non-mip) that closely match a higher resolution base texture (via perceptual hashing)
+## 1. Quick Start
 
-## Dependencies
+```powershell
+# Game folder mode (auto uses dumps/intermediates/replacements)
+python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -g "C:\Users\you\Documents\PCSX2\textures\<GAME_SERIAL>"
 
-- Python 3.7+
-- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (native or Python version)
-- [PCSX2](https://pcsx2.net/) (for texture dumping/loading)
+# Add ID-based replacement & verbose timing
+python upscale.py -r <realesrgan> -g <game_path> --id-replace -vv
 
-## PCSX2 Setup
-
-1. **Enable Texture Dumping:**
-	- In PCSX2, go to `Settings > Graphics > Texture Replacement > Dump Textures` and enable it.
-	- Run your game; textures as they are loaded and rendered will appear in the `dumps` folder. 
-
-2. **Enable Texture Replacement:**
-	- In PCSX2, go to `Settings > Graphics > Texture Replacement > Load Textures` and enable it.
-    - Enabling `Asynchronous Texture Loading` and `Precache Textures` is recommend to avoid slowdown and hitches, especially using Vulkan renderer
-
-## Folder Structure
-
-When using the `-g`/`--game` argument, simply specify the path to your PCSX2 game texture folder (for example, `C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>`). The script will automatically look for and use the following subfolders:
-
-- `dumps\` — Contains the original textures dumped by PCSX2 as you play the game.
-- `intermediates\` — Used by the script to store upscaled and patched textures (created automatically if it doesn't exist).
-- `replacements\` — Where the final upscaled textures are placed for PCSX2 to load as replacements.
-
-These folders are not required to be created manually (except for `dumps`, which is created by PCSX2 when dumping textures). The script will create `intermediates` and `replacements` as needed. This structure is typical for PCSX2 texture workflows, but you can also specify custom paths using the original arguments if desired.
-
-## Verbosity
-
-You can control how much output the script prints using the `-v`/`--verbose` flag. Add more `v`s for more detail (e.g., `-v`, `-vv`, `-vvv`). The default is minimal output; higher levels show more information about the upscaling process, mip patching, and file copying.
-
-## Usage
-
-1. Install dependencies.
-2. Create an `intermediates` folder next to your `dumps` and `replacements` folders.
-3. Run the script:
-	```
-	python upscale.py -r <path_to_realesrgan> -g <path_to_game_textures>
-	```
-	- Example:
-	  ```
-	  python upscale.py -r "C:\realesrgan\realesrgan-ncnn-vulkan.exe" -g "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>"
-	  ```
-	- You can pass extra arguments to Real-ESRGAN with `--realesrgan-args "<args>"`.
-
-4. The upscaled textures will be ready in the `replacements` folder for PCSX2.
-
-Note: This script and PCSX2 do not run continuously. As the game is played, more textures are dumped to disk and need to be upscaled. PCSX2 needs to have replacement textures manually refreshed. A hotkey can be bound in `Settings > Hotkeys` under `Graphics > Reload Texture Replacements`.
-
-## Detecting visually similar LOD textures
-
-Some games ship reduced-detail meshes that reference their own *different* texture files instead of relying on mip chains. After upscaling you might have multiple near-duplicate textures (e.g. a 1024x1024 and a separate 256x256 file) where only the larger one truly needs to remain. The helper script `detect_similar_images.py` searches the `intermediates` folder for low‑resolution, non-mip textures that are perceptually similar to a larger texture.
-
-Run examples:
-```
-python detect_similar_images.py -g "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>"
-python detect_similar_images.py -i "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>\intermediates" --hash-threshold 6 --verify-diff --diff-threshold 12
+# Dry run preview (no writes)
+python upscale.py -r <realesrgan> -g <game_path> --id-replace --dry-run -vv
 ```
 
-Output lines look like:
+Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Load Textures" is enabled; use the hotkey to reload as needed).
+
+---
+
+## 2. Core Features
+
+| Area | What it does |
+|------|--------------|
+| Upscaling | One Real-ESRGAN pass across all dumped textures |
+| Mip Patching | Highest mip copied onto all lower mip variants (`*-mipN`) |
+| ID Variant Consolidation (optional) | Replaces smaller per-ID textures with perceptually similar larger ones in the same ID group |
+| Similarity Detection (helper script) | Reports visually similar non-mip low-res vs high-res pairs (hash + optional pixel diff) |
+| Safety & Preview | Dry run mode + multi-level verbosity (`-v`, `-vv`, `-vvv`) |
+
+---
+
+## 3. Requirements
+
+* Python 3.7+
+* [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (native NCNN or Python script)
+* [PCSX2](https://pcsx2.net/) (for texture dumping/loading)
+* Pillow (`pip install Pillow`) for similarity features
+
+---
+
+## 4. PCSX2 Configuration
+
+1. Enable dumping: `Settings > Graphics > Texture Replacement > Dump Textures`.
+2. Enable loading: `Settings > Graphics > Texture Replacement > Load Textures`.
+3. Optional performance: enable `Asynchronous Texture Loading` + `Precache Textures` (esp. with Vulkan).
+4. Bind a hotkey: `Graphics > Reload Texture Replacements` to apply new replacements after each upscale run.
+
+---
+
+## 5. Folder Layout (Game Mode `-g`)
+
+Given `-g C:\...\textures\<GAME_SERIAL>`:
+
 ```
-LOW 256x256 foo_small.png -> HIGH 1024x1024 foo_big.png (hamming=4, diff=7.9)
-```
-Columns show the matched low/high texture names, sizes, hash distance, and optional mean absolute difference (if `--verify-diff` used). A CSV can be written with `--csv report.csv`.
-
-Key options:
-- `--base-size N` (default 1024) threshold to consider a texture high-res
-- `--hash-size` (default 8) perceptual hash dimension (NxN)
-- `--hash-threshold` maximum Hamming distance for a potential match
-- `--verify-diff` enables pixel diff confirmation (slower, more precise)
-- `--diff-threshold` mean absolute pixel difference limit when verifying
-
-Use the report to decide whether to remove / alias / copy the higher resolution texture over the low one for consistency.
-
-### Advanced options
-
-Additional tuning / inspection flags in `detect_similar_images.py`:
-
-- `--pair A B` : Directly compare two specific images (prints hash distance and optional diff) without scanning directories.
-- `--top-k K` : For each low-res texture, list the K closest high-res candidates (ignores the hash threshold for listing; threshold still governs match list).
-- `--limit N` : Only process the first N low-res textures (after sorting) for faster experimentation.
-- `--visual-dir VIS` : Generate visual composites (side-by-side + diff heatmap) for each match into a folder named `VIS` placed alongside the `intermediates` folder if `VIS` is a relative path. An `index.html` gallery is also generated unless `--no-html` is specified.
-- `--no-html` : Skip creating the HTML gallery (still writes composite PNGs).
-- `--csv file.csv` : Write match data to CSV.
-
-Example with visuals and gallery (will create a sibling folder to `intermediates`):
-```
-python detect_similar_images.py -g "C:\Users\username\Documents\PCSX2\textures\<GAME_SERIAL>" \
-	--base-size 256 --hash-threshold 8 --verify-diff --diff-threshold 15 \
-	--top-k 5 --visual-dir visuals --csv matches.csv
+<GAME_SERIAL>\
+	dumps\          # Created by PCSX2 (input to pipeline)
+	intermediates\  # Created by script (upscaled + patched working set)
+	replacements\   # Final output PCSX2 consumes
 ```
 
-The composite image layout:
-- Left: Low-res texture scaled to high size (nearest) showing original pixel structure
-- Middle: High-res candidate
-- Right: Red heatmap (intensity represents per-pixel difference)
+You may override with explicit `-i -m -o` paths instead of `-g`.
 
-Hash distance guidance (aHash 8x8):
-- 0–4: Very similar / near-identical overall tone & structure
-- 5–10: Similar with some changes (details, color variations)
-- 11–20: Possibly related but diverging
-- 21+: Usually unrelated
+---
 
-Lower `--hash-size` makes the hash coarser and more tolerant to small changes; higher sizes increase discrimination but may inflate distances for minor variations.
+## 6. Verbosity Levels
 
-## License
+| Flag | Adds |
+|------|------|
+| (none) | Summary only |
+| -v | Configuration + step summaries |
+| -vv | Discovery details (commands, grouping) |
+| -vvv | Per-file actions (copy, hash outcomes) |
+| -vvvv | Raw Real-ESRGAN stderr passthrough |
+
+---
+
+## 7. Command Overview (Main Script)
+
+| Flag | Purpose |
+|------|---------|
+| `-g / --game PATH` | Use standard PCSX2 texture folder layout |
+| `-i / -m / -o` | Manual input/intermediate/output paths |
+| `-r / --realesrgan` | Real-ESRGAN executable / script or directory |
+| `--realesrgan-args "..."` | Extra args passed through untouched |
+| `--dry-run` | Simulate all steps (no writes) |
+| `--id-replace` | Enable ID-based small→large texture replacement |
+| `--id-small-threshold N` | Max dimension marking SMALL (default 256) |
+| `--id-large-threshold N` | Min dimension marking LARGE (default 256) |
+| `--id-hash-size S` | aHash size 4–16 (default 8) |
+| `--id-hash-threshold D` | Max Hamming distance to allow replacement (default 6) |
+
+---
+
+## 8. ID-Based Small Texture Replacement
+
+Many games embed alternate LOD texture variants instead of relying purely on mip chains. These often differ only by an internal numeric second segment in the filename (`prefix-<ID>-rest.png`). This feature consolidates smaller variants to the best matching larger one—only when they are visually similar.
+
+Process per ID group:
+1. Split into LARGE (≥ `--id-large-threshold`) and SMALL (< `--id-small-threshold`).
+2. Compute aHash for each LARGE & SMALL (configurable size `--id-hash-size`).
+3. For each SMALL choose the LARGE with minimum Hamming distance.
+4. Replace only if distance ≤ `--id-hash-threshold`.
+
+Tuning tips:
+* Start with defaults (`8 / 6`). If many legitimate matches are skipped, raise threshold to 7–9.
+* If false positives occur, either lower threshold or raise hash size to 10–12 (and re-adjust threshold ~10–15% of bits).
+* Use `--dry-run -vv` to inspect which pairs would be replaced vs skipped (`Similarity skips`).
+
+Example:
+```powershell
+python upscale.py -r <realesrgan> -g <game_path> --id-replace \
+	--id-small-threshold 256 --id-large-threshold 512 \
+	--id-hash-size 8 --id-hash-threshold 8 -vv
+```
+
+---
+
+## 9. Similarity Analysis Helper (`detect_similar_images.py`)
+
+Use this separate tool to audit non-mip low-res textures that are near duplicates of higher-res bases (useful for manual cleanup or validating ID replacement).
+
+Basic examples:
+```powershell
+python detect_similar_images.py -g "C:\Users\you\Documents\PCSX2\textures\<GAME_SERIAL>"
+python detect_similar_images.py -i "...\intermediates" --hash-threshold 6 --verify-diff --diff-threshold 12
+```
+
+Key arguments:
+| Flag | Meaning |
+|------|---------|
+| `-g / -i` | Select intermediates folder automatically or directly |
+| `--base-size N` | Boundary between high vs low (default 1024). Use 256 to mirror ID replacement scale |
+| `--hash-size S` | aHash dimension (NxN) |
+| `--hash-threshold D` | Hamming distance cutoff for candidate match |
+| `--verify-diff` | Adds mean absolute pixel diff check (costlier, more precise) |
+| `--diff-threshold X` | Pixel diff threshold (0–255 scale) |
+| `--top-k K` | Show K closest highs per low (ignores threshold for listing) |
+| `--pair A B` | Direct compare two images |
+| `--visual-dir DIR` | Generate composite + heatmap images (+ optional gallery) |
+| `--csv file.csv` | Export matches |
+
+Interpretation (aHash 8×8 guidance):
+* 0–4: Near-identical
+* 5–10: Similar (minor detail/color changes)
+* 11–20: Loosely related / maybe different variant
+* 21+: Usually unrelated
+
+Tip: For parity with ID replacement logic, run with `--base-size 256 --hash-size 8`.
+
+Visual output (when using `--visual-dir`):
+* Left: Low texture scaled (nearest) – reveals original pixel grid.
+* Middle: High texture.
+* Right: Red heatmap (difference intensity per pixel).
+
+---
+
+## 10. Workflow Summary
+
+1. Play game to populate `dumps/`.
+2. Run upscale pipeline (optionally with `--id-replace`).
+3. Reload texture replacements in PCSX2 (hotkey).
+4. (Optional) Run similarity helper to audit leftover variants.
+5. Iterate as more textures dump.
+
+---
+
+## 11. Troubleshooting
+
+| Symptom | Suggestion |
+|---------|------------|
+| No images found | Verify `dumps/` not empty; correct `-g` path or `-i` directory |
+| Real-ESRGAN non-zero exit | Check executable path & needed model files; run command manually with `-vv` for full args |
+| Few ID replacements | Increase `--id-hash-threshold` or lower small/large thresholds; confirm groupings with `-vv` |
+| Incorrect replacements | Lower threshold or raise `--id-hash-size`; inspect with dry run first |
+| Pillow import errors | `pip install Pillow` in your active Python environment |
+
+---
+
+## 12. Cheat Sheet
+
+| Goal | Command (PowerShell) |
+|------|----------------------|
+| Basic upscale | `python upscale.py -r <realesrgan> -g <game>` |
+| Include ID replacement | `python upscale.py -r <realesrgan> -g <game> --id-replace -vv` |
+| Dry run preview | `python upscale.py -r <realesrgan> -g <game> --id-replace --dry-run -vv` |
+| Similarity audit (defaults) | `python detect_similar_images.py -g <game>` |
+| Similarity audit @256 base | `python detect_similar_images.py -g <game> --base-size 256` |
+| Visual gallery | `python detect_similar_images.py -g <game> --visual-dir visuals --hash-threshold 8` |
+
+---
+
+## 13. License
 
 See [LICENSE](LICENSE) for details.
