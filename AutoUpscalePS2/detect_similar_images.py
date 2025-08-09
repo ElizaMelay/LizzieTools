@@ -81,18 +81,24 @@ class ImgInfo:
 
 def parse_args() -> argparse.Namespace:
 	p = argparse.ArgumentParser(description="Detect visually similar non-mip low-res textures to high-res base textures.")
-	group = p.add_mutually_exclusive_group(required=True)
+	group = p.add_mutually_exclusive_group(required=False)
 	group.add_argument("-i", "--intermediates", help="Path to intermediates folder to scan")
 	group.add_argument("-g", "--game", help="Path to PCSX2 game texture root (expects intermediates subfolder)")
+	# Pairwise direct comparison mode (skips directory scan requirements)
+	p.add_argument("--pair", nargs=2, metavar=("IMG_A", "IMG_B"), help="Directly compare two image files (bypasses -i/-g requirements)")
 	p.add_argument("--base-size", type=int, default=1024, help="Size threshold (>= either dimension) to classify as high-res (default: 1024)")
 	p.add_argument("--hash-size", type=int, default=8, help="aHash square dimension (default 8 => 64 bits)")
 	p.add_argument("--hash-threshold", type=int, default=6, help="Maximum Hamming distance between hashes to consider candidates (default 6)")
-	p.add_argument("--verify-diff", action="store_true", help="After hash match, compute mean absolute pixel diff to confirm")
+	p.add_argument("--top-k", type=int, metavar="K", help="Show top K closest high-res candidates for each low-res texture (ignoring hash-threshold filter)")
+	p.add_argument("--verify-diff", action="store_true", help="After hash match (and for --top-k), compute mean absolute pixel diff to confirm")
 	p.add_argument("--diff-threshold", type=float, default=12.0, help="Mean absolute difference (0-255) threshold if --verify-diff (default 12.0)")
 	p.add_argument("--csv", help="Optional path to write matches as CSV")
 	p.add_argument("--limit", type=int, help="Optional limit on number of low-res textures to process")
 	p.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (-v, -vv)")
-	return p.parse_args()
+	args = p.parse_args()
+	if not args.pair and not (args.intermediates or args.game):
+		p.error("Must supply either --pair or one of -i/--intermediates or -g/--game")
+	return args
 
 
 def is_non_mip_image(path: Path) -> bool:
@@ -142,7 +148,6 @@ def mean_abs_diff_resized(low_path: Path, high_path: Path) -> float:
 		total = 0
 		for (r1, g1, b1), (r2, g2, b2) in zip(low_px, high_px):
 			total += abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
-		# 3 channels
 		return total / (len(low_px) * 3)
 
 
@@ -172,6 +177,29 @@ def load_images(root: Path, hash_size: int, verbose: int) -> List[ImgInfo]:
 def main() -> None:
 	args = parse_args()
 
+	# Pairwise comparison mode
+	if args.pair:
+		img_a, img_b = map(Path, args.pair)
+		if not img_a.exists() or not img_b.exists():
+			print("[Error] One or both pair image paths do not exist.")
+			return
+		if args.hash_size < 4 or args.hash_size > 16:
+			print("[Error] hash-size must be between 4 and 16 for pair mode")
+			return
+		bits_a, w_a, h_a, _ = compute_ahash(img_a, args.hash_size)
+		bits_b, w_b, h_b, _ = compute_ahash(img_b, args.hash_size)
+		dist = hamming_distance(bits_a, bits_b)
+		print(f"[Pair] {img_a.name} ({w_a}x{h_a}) vs {img_b.name} ({w_b}x{h_b})")
+		print(f"  aHash distance: {dist} (hash-size={args.hash_size})")
+		if args.verify_diff:
+			try:
+				diff_val = mean_abs_diff_resized(img_a, img_b)
+				print(f"  Mean abs diff (resized): {diff_val:.2f}")
+			except OSError as e:
+				print(f"  [Warn] Could not compute diff: {e}")
+		return
+
+	# Directory scan mode
 	if args.game:
 		base = Path(args.game).resolve()
 		root = base / "intermediates"
@@ -209,14 +237,18 @@ def main() -> None:
 		low = low[: args.limit]
 
 	matches: List[Tuple[ImgInfo, ImgInfo, int, Optional[float]]] = []
+	topk_results: List[Tuple[ImgInfo, List[Tuple[int, ImgInfo, Optional[float]]]]] = [] if args.top_k else []
+
 	for li in low:
 		best: Optional[Tuple[ImgInfo, int]] = None
+		candidate_list: List[Tuple[int, ImgInfo]] = [] if args.top_k else None
 		for hi in high:
 			dist = hamming_distance(li.hash_bits, hi.hash_bits)
 			if best is None or dist < best[1]:
 				best = (hi, dist)
-			# Early exit if exact or below threshold 0
-			if dist == 0:
+			if candidate_list is not None:
+				candidate_list.append((dist, hi))
+			if candidate_list is None and dist == 0:
 				break
 		assert best is not None
 		hi, dist = best
@@ -234,23 +266,44 @@ def main() -> None:
 						print(f"[Skip] {li.path.name} best {hi.path.name} diff {diff_val:.1f} > threshold {args.diff_threshold}")
 					continue
 			matches.append((li, hi, dist, diff_val))
+		if args.top_k and candidate_list:
+			candidate_list.sort(key=lambda t: (t[0], t[1].path.name))
+			k_items = candidate_list[: args.top_k]
+			k_items_enriched: List[Tuple[int, ImgInfo, Optional[float]]] = []
+			for dval, himg in k_items:
+				if args.verify_diff:
+					try:
+						ddiff = mean_abs_diff_resized(li.path, himg.path)
+					except OSError:
+						ddiff = None
+				else:
+					ddiff = None
+				k_items_enriched.append((dval, himg, ddiff))
+			topk_results.append((li, k_items_enriched))
 
 	if not matches:
 		print("[Result] No similar low-res textures found under thresholds.")
-		return
+	else:
+		print("[Result] Potential similar low-res -> high-res pairs:")
+		for li, hi, dist, diff_val in matches:
+			size_l = f"{li.width}x{li.height}"
+			size_h = f"{hi.width}x{hi.height}"
+			extra = f", diff={diff_val:.1f}" if diff_val is not None else ""
+			print(f"  LOW {size_l:>9} {li.path.name:<40} -> HIGH {size_h:>9} {hi.path.name:<40} (hamming={dist}{extra})")
 
-	print("[Result] Potential similar low-res -> high-res pairs:")
-	for li, hi, dist, diff_val in matches:
-		size_l = f"{li.width}x{li.height}"
-		size_h = f"{hi.width}x{hi.height}"
-		extra = f", diff={diff_val:.1f}" if diff_val is not None else ""
-		print(f"  LOW {size_l:>9} {li.path.name:<40} -> HIGH {size_h:>9} {hi.path.name:<40} (hamming={dist}{extra})")
+	if args.top_k and topk_results:
+		print(f"[TopK] Showing top {args.top_k} candidates per low-res texture (hash-size={args.hash_size})")
+		for li, items in topk_results:
+			print(f"  {li.path.name} ({li.width}x{li.height})")
+			for dval, himg, ddiff in items:
+				extra = f", diff={ddiff:.1f}" if ddiff is not None else ""
+				print(f"     -> {himg.path.name:<40} {himg.width}x{himg.height} hamming={dval}{extra}")
 
-	if args.csv:
+	if args.csv and matches:
 		csv_path = Path(args.csv)
 		with csv_path.open("w", newline="", encoding="utf-8") as f:
 			w = csv.writer(f)
-			w.writerow(["low_name", "low_w", "low_h", "high_name", "high_w", "high_h", "hamming", "diff"])  # header
+			w.writerow(["low_name", "low_w", "low_h", "high_name", "high_w", "high_h", "hamming", "diff"])
 			for li, hi, dist, diff_val in matches:
 				w.writerow([li.path.name, li.width, li.height, hi.path.name, hi.width, hi.height, dist, f"{diff_val:.3f}" if diff_val is not None else ""])    
 		print(f"[Write] CSV report: {csv_path}")
