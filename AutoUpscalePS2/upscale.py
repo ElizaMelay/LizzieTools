@@ -85,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Min dimension at or above which a texture is considered LARGE for ID-based replacement (default 256)",
     )
+    parser.add_argument(
+        "--id-hash-threshold",
+        type=int,
+        default=6,
+        help="Max aHash Hamming distance to allow replacement for ID-based similarity (default 6)",
+    )
+    parser.add_argument(
+        "--id-hash-size",
+        type=int,
+        default=8,
+        help="aHash size (NxN) for ID-based similarity (4-16, default 8)",
+    )
     return parser.parse_args()
 
 def vprint(msg: str, level: int, verbosity: int):
@@ -307,7 +319,16 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, e
     return copied_count
 
 
-def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
+def replace_small_id_variants(
+    root: Path,
+    small_thresh: int,
+    large_thresh: int,
+    hash_size: int,
+    hash_threshold: int,
+    dry_run: bool = False,
+    verbosity: int = 0,
+    errors: Optional[List[str]] = None,
+) -> int:
     """Replace small textures (< small_thresh) with a large texture (>= large_thresh) when they share
     the same second ID segment (filename stem split by '-'). Only considers non-mip files.
 
@@ -326,9 +347,17 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
         print("[IDReplace][Error] Pillow not installed; cannot inspect image sizes. Skipping.")
         return 0
 
-    # Hash parameters (chosen to mirror detect_similar_images defaults but fixed to keep CLI simple)
-    SIM_HASH_SIZE = 8  # 8x8 -> 64 bits
-    SIM_HASH_THRESHOLD = 6  # Max Hamming distance to treat as similar
+    # Hash parameters are now configurable
+    SIM_HASH_SIZE = hash_size
+    SIM_HASH_THRESHOLD = hash_threshold
+
+    # Validate early (in case function is reused independently of CLI validation)
+    if SIM_HASH_SIZE < 4 or SIM_HASH_SIZE > 16:
+        print(f"[IDReplace][Error] Invalid hash size: {SIM_HASH_SIZE} (must be 4..16)")
+        return 0
+    if SIM_HASH_THRESHOLD < 0 or SIM_HASH_THRESHOLD > SIM_HASH_SIZE * SIM_HASH_SIZE:
+        print(f"[IDReplace][Error] Invalid hash threshold: {SIM_HASH_THRESHOLD}")
+        return 0
 
     def compute_ahash(path: Path) -> Optional[int]:
         """Compute an average hash (aHash) for similarity gating. Returns 64-bit int or None on failure."""
@@ -385,42 +414,59 @@ def replace_small_id_variants(root: Path, small_thresh: int, large_thresh: int, 
 
     replacements = 0
     similarity_skips = 0
+    hash_cache: Dict[Path, int] = {}
+    def get_hash(p: Path) -> Optional[int]:
+        if p in hash_cache:
+            return hash_cache[p]
+        h = compute_ahash(p)
+        if h is not None:
+            hash_cache[p] = h
+        return h
     for key, items in groups.items():
         # Partition into large and small based on thresholds
         large_items = [it for it in items if max(it[1], it[2]) >= large_thresh]
         small_items = [it for it in items if max(it[1], it[2]) < small_thresh]
         if not large_items or not small_items:
             continue
-        # Choose canonical large: largest area
-        large_items.sort(key=lambda t: (-(t[1] * t[2]), -max(t[1], t[2])))
-        canonical = large_items[0]
-        canon_path, cw, ch = canonical[0], canonical[1], canonical[2]
-        canon_hash = compute_ahash(canon_path)
-        if canon_hash is None:
-            # Cannot compute hash; skip whole group for safety
+        # Pre-compute hashes for large candidates; skip group if none hashable
+        large_info: List[Tuple[Path, int, int, Optional[int]]] = []  # path, w, h, hash
+        for lp, lw, lh in large_items:
+            hval = get_hash(lp)
+            if hval is not None:
+                large_info.append((lp, lw, lh, hval))
+        if not large_info:
             if verbosity >= 2:
-                print(f"[IDReplace] Skipping group key={key} (failed to hash canonical {canon_path.name})")
+                print(f"[IDReplace] Skipping group key={key} (no hashable large images)")
             continue
         for small_path, sw, sh in small_items:
-            if small_path == canon_path:
-                continue
-            small_hash = compute_ahash(small_path)
+            small_hash = get_hash(small_path)
             if small_hash is None:
                 continue
-            dist = hamming(canon_hash, small_hash)
+            # Find best large candidate (min hamming). Tie-breaker: larger area, then name
+            best_candidate: Optional[Tuple[int, Path, int, int]] = None  # dist, path, w, h
+            for lp, lw, lh, lhash in large_info:
+                dist = hamming(lhash, small_hash)
+                if best_candidate is None or dist < best_candidate[0] or (
+                    dist == best_candidate[0] and (lw*lh) > (best_candidate[2]*best_candidate[3])
+                ):
+                    best_candidate = (dist, lp, lw, lh)
+                if dist == 0:  # perfect match early exit
+                    break
+            assert best_candidate is not None
+            dist, best_path, bw, bh = best_candidate
             if dist > SIM_HASH_THRESHOLD:
                 similarity_skips += 1
                 if verbosity >= 3:
-                    print(f"[IDReplace] Skip (not similar) {small_path.name} vs {canon_path.name} hamming={dist} > {SIM_HASH_THRESHOLD}")
+                    print(f"[IDReplace] Skip (not similar) {small_path.name} vs {best_path.name} hamming={dist} > {SIM_HASH_THRESHOLD}")
                 continue
             vprint(
-                f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {canon_path.name} ({cw}x{ch}) [key={key}] hamming={dist}",
+                f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {best_path.name} ({bw}x{bh}) [key={key}] hamming={dist}",
                 2,
                 verbosity,
             )
             if not dry_run:
                 try:
-                    shutil.copy2(canon_path, small_path)
+                    shutil.copy2(best_path, small_path)
                 except PermissionError:
                     msg = f"[IDReplace][Error] Permission denied overwriting {small_path}"
                     print(msg)
@@ -486,6 +532,12 @@ def main() -> None:
     vprint(f"  Real-ESRGAN: {args.realesrgan}", 1, verbosity)
     if args.realesrgan_args:
         vprint(f"  Real-ESRGAN extra args: {args.realesrgan_args}", 1, verbosity)
+    if args.id_replace:
+        vprint(
+            f"  ID Replace: small<={args.id_small_threshold} large>={args.id_large_threshold} hash_size={args.id_hash_size} hash_threshold={args.id_hash_threshold}",
+            1,
+            verbosity,
+        )
     if args.dry_run:
         print("  Dry run: enabled (no changes will be made)")
 
@@ -561,6 +613,8 @@ def main() -> None:
             interm_dir,
             args.id_small_threshold,
             args.id_large_threshold,
+            args.id_hash_size,
+            args.id_hash_threshold,
             dry_run=args.dry_run,
             verbosity=verbosity,
             errors=errors,
