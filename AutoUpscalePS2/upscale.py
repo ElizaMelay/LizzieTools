@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp"}
@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
         help="Increase output verbosity (can be specified multiple times, e.g. -vvv)",
     )
     return parser.parse_args()
+
 def vprint(msg: str, level: int, verbosity: int):
     if verbosity >= level:
         print(msg)
@@ -107,43 +108,71 @@ def discover_realesrgan_cmd(path: Path) -> List[str]:
 
 
 def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, extra_args: str, dry_run: bool = False, verbosity: int = 0) -> int:
+    """Run Real-ESRGAN once on the directory using -i/-o.
+    Streams stderr to capture only lines with error keywords while ignoring progress noise.
+    Returns process return code (0 means success) unless keyword errors were detected.
     """
-    Attempt to run Real-ESRGAN once on the whole directory using -i/-o.
-    Returns process return code (0 means success). If dry_run, returns 0.
-    """
-    # Split extra args respecting quotes
     import shlex
+    import threading
 
     args = cmd + ["-i", str(input_dir), "-o", str(output_dir)]
     if extra_args:
         args += shlex.split(extra_args)
 
-    vprint(f"[Real-ESRGAN] Command: {' '.join(args)}", 3, verbosity)
+    vprint(f"[Step 1] Real-ESRGAN command: {' '.join(args)}", 3, verbosity)
     if dry_run:
         return 0
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    vprint(proc.stdout, 3, verbosity)
 
-    error_lines = []
     error_keywords = ["error", "failed", "invalid", "exception", "unable", "not found", "denied"]
+    keyword_hits: List[str] = []
 
-    if proc.stderr:
-        for line in proc.stderr.splitlines():
-            line_stripped = line.strip()
-            # Check for error keywords only
-            if any(kw in line_stripped.lower() for kw in error_keywords):
-                error_lines.append(line)
+    # Use Popen for incremental stderr read (avoid buffering huge progress output)
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
 
-    if error_lines:
-        print("[Error] Real-ESRGAN reported the following error output:")
-        for err in error_lines:
-            print(err)
-        return 1
+    def read_stdout():
+        if not proc.stdout:
+            return
+        for line in proc.stdout:
+            if verbosity >= 3:
+                print(line.rstrip())
+
+    def read_stderr():
+        if not proc.stderr:
+            return
+        for line in proc.stderr:
+            ls = line.strip()
+            # We purposely do NOT treat percentage or other non-keyword lines as errors
+            if any(kw in ls.lower() for kw in error_keywords):
+                keyword_hits.append(line.rstrip())
+            elif verbosity >= 4:  # ultra-verbose raw stderr
+                print(f"[Real-ESRGAN stderr] {ls}")
+
+    t_out = threading.Thread(target=read_stdout)
+    t_err = threading.Thread(target=read_stderr)
+    t_out.start(); t_err.start()
+    # Wait for process to exit; threads keep draining pipes until EOF.
+    proc.wait()
+    # Fully join reader threads (no timeout) to ensure all remaining lines processed.
+    t_out.join(); t_err.join()
+
+    if keyword_hits:
+        print("[Error] Real-ESRGAN emitted error indicators:")
+        for l in keyword_hits:
+            print(l)
+        # Prefer non-zero code if present, else synthesize failure code 1
+        return proc.returncode if proc.returncode != 0 else 1
 
     return proc.returncode
 
 
-def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0) -> None:
+def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
     """
     For files matching *-mipN*.{ext}, copy the highest mip (the file WITHOUT the -mip suffix)
     to all other mip levels in the same group.
@@ -183,6 +212,7 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0) -
                 base_map[(d, key, ext)] = d / base_name
 
     total_overwrites = 0
+    anomalous_groups = 0
     for (d, key, ext), mip_map in groups.items():
         if not mip_map:
             continue
@@ -191,21 +221,38 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0) -
             # Fallback to the smallest mip index (legacy behavior) if no base is present
             highest_mip = min(mip_map.keys())  # usually 0
             src_path = mip_map[highest_mip]
+        # Check for gaps in mip indices (e.g., have 0,2 but missing 1)
+        mip_indices = sorted(mip_map.keys())
+        expected = list(range(mip_indices[0], mip_indices[-1] + 1))
+        if mip_indices != expected:
+            anomalous_groups += 1
+            vprint(f"[Mips][Warn] Non-contiguous mip chain in {d}: {mip_indices}", 3, verbosity)
         for mip, dst_path in mip_map.items():
             if src_path == dst_path:
                 continue
             vprint(f"[Mips] Overwrite {dst_path.name} with {src_path.name}", 2, verbosity)
             total_overwrites += 1
             if not dry_run:
-                # Overwrite bytes
-                shutil.copyfile(src_path, dst_path)
+                try:
+                    shutil.copyfile(src_path, dst_path)
+                except PermissionError as e:
+                    msg = f"[Error] Permission denied while overwriting mip file: {dst_path} (is it read-only?)"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                except OSError as e:
+                    msg = f"[Error] Failed to overwrite mip file: {dst_path} ({e.strerror or e})"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
     if dry_run:
-        vprint(f"  Would have patched {total_overwrites} files (dry run, no changes made).", 1, verbosity)
+        vprint(f"  Would have patched {total_overwrites} files (dry run).", 1, verbosity)
     else:
-        vprint(f"  Patched {total_overwrites} files.", 1, verbosity)
+        vprint(f"  Patched {total_overwrites} files (anomalous groups: {anomalous_groups}).", 1, verbosity)
+    return total_overwrites
 
 
-def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0) -> None:
+def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
     vprint(f"[Copy] Mirroring {src} -> {dst}", 3, verbosity)
     copied_count = 0
     for dirpath, dirnames, filenames in os.walk(src):
@@ -218,17 +265,34 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0) -
             dst_file = out_dir / fn
             vprint(f"[Copy] {src_file} -> {dst_file}", 3, verbosity)
             if not dry_run:
-                shutil.copy2(src_file, dst_file)
+                try:
+                    shutil.copy2(src_file, dst_file)
+                except PermissionError:
+                    msg = f"[Error] Permission denied copying to: {dst_file} (directory or file may be read-only)"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
+                except OSError as e:
+                    msg = f"[Error] Failed to copy {src_file} -> {dst_file}: {e.strerror or e}"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
             copied_count += 1
     if dry_run:
-        vprint(f"  Would have copied {copied_count} files (dry run, no changes made).", 1, verbosity)
+        vprint(f"  Would have copied {copied_count} files (dry run).", 1, verbosity)
     else:
         vprint(f"  Copied {copied_count} files.", 1, verbosity)
+    return copied_count
 
 
 def main() -> None:
     args = parse_args()
     verbosity = args.verbose
+    from time import perf_counter
+
+    t_start = perf_counter()
 
     # Single banner line
     if args.game:
@@ -274,31 +338,96 @@ def main() -> None:
         print(f"[Error] Input folder does not exist or is not a directory: {input_dir}")
         sys.exit(1)
 
+    # Safety: disallow overlapping directories
+    if input_dir == interm_dir or input_dir == output_dir or interm_dir == output_dir:
+        print("[Error] Input, intermediate, and output directories must be distinct.")
+        sys.exit(1)
+
     if not args.dry_run:
         interm_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Count input image files
-    input_files = []
-    for dirpath, _, filenames in os.walk(input_dir):
-        for fn in filenames:
-            ext = Path(fn).suffix.lower()
-            if ext in IMAGE_EXTS:
-                input_files.append(os.path.join(dirpath, fn))
-    vprint(f"[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
-    vprint(f"  Found {len(input_files)} input image files.", 1, verbosity)
+    # Writable directory pre-checks (skip if dry-run)
+    def check_writable(d: Path) -> bool:
+        if args.dry_run:
+            return True
+        import tempfile
+        try:
+            with tempfile.TemporaryFile(dir=d):
+                pass
+            return True
+        except PermissionError:
+            print(f"[Error] Directory not writable (permission denied): {d}")
+            return False
+        except OSError as e:
+            # Some environments might block creation differently
+            print(f"[Error] Directory not writable: {d} ({e.strerror or e})")
+            return False
+
+    if not check_writable(interm_dir) or not check_writable(output_dir):
+        sys.exit(2)
+
+    # Optionally enumerate input files only if verbosity or dry_run (performance win for default quiet mode)
+    input_files: List[str] = []
+    if verbosity >= 1 or args.dry_run:
+        for dirpath, _, filenames in os.walk(input_dir):
+            for fn in filenames:
+                ext = Path(fn).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    input_files.append(os.path.join(dirpath, fn))
+        vprint(f"[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
+        vprint(f"  Found {len(input_files)} input image files.", 1, verbosity)
+        if len(input_files) == 0:
+            print("[Info] No input images found. Nothing to do.")
+            return
+    else:
+        vprint("[Step 1] Running Real-ESRGAN on input folder -> intermediate folder", 1, verbosity)
+
+    t_step1 = perf_counter()
     realesrgan_path = Path(args.realesrgan)
+    # Resolve path for clearer logging
+    realesrgan_path = realesrgan_path.resolve()
     cmd = discover_realesrgan_cmd(realesrgan_path)
+    if verbosity >= 2:
+        vprint(f"[Discover] Using Real-ESRGAN command: {' '.join(cmd)}", 2, verbosity)
     rc = run_realesrgan_on_dir(cmd, input_dir, interm_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
     if rc != 0:
         print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
         sys.exit(rc)
+    t_step1_end = perf_counter()
 
     vprint("[Step 2] Patching mip levels in intermediate folder", 1, verbosity)
-    patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity)
+    t_step2 = perf_counter()
+    errors: List[str] = []
+    mips_patched = patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
+    t_step2_end = perf_counter()
 
     vprint("[Step 3] Copying upscaled textures to final output folder", 1, verbosity)
-    copy_tree(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity)
+    t_step3 = perf_counter()
+    files_copied = copy_tree(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
+    t_step3_end = perf_counter()
+
+    total_elapsed = perf_counter() - t_start
+    if verbosity >= 0:
+        if errors:
+            print("[Summary] Pipeline completed with errors")
+        else:
+            print("[Summary] Pipeline complete")
+        if verbosity >= 1:
+            step1_time = t_step1_end - t_step1
+            step2_time = t_step2_end - t_step2
+            step3_time = t_step3_end - t_step3
+            if input_files:
+                print(f"  Input images: {len(input_files)} - upscaled in {step1_time:.2f}s")
+            print(f"  Mips patched: {mips_patched} - processed in {step2_time:.2f}s")
+            print(f"  Files copied: {files_copied} - completed in {step3_time:.2f}s")
+            print(f"  Total elapsed: {total_elapsed:.2f}s")
+            if errors:
+                print(f"  Errors: {len(errors)} (see above messages)")
+
+    if errors:
+        # Distinguish from Real-ESRGAN failure exit code (already handled earlier)
+        sys.exit(3)
 
     vprint("[Done] Upscaling pipeline completed.", 0, verbosity)
 
