@@ -106,6 +106,10 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="aHash size (NxN) for ID-based similarity (4-16, default 8)",
     )
+    parser.add_argument(
+        "-c", "--clean", action="store_true",
+        help="Wipe the intermediate cache folder before processing (forces full re-upscale)."
+    )
     return parser.parse_args()
 
 def vprint(msg: str, level: int, verbosity: int):
@@ -641,6 +645,20 @@ def main() -> None:
         interm_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional clean of intermediates
+    if args.clean:
+        if args.dry_run:
+            vprint(f"[Clean] Would remove all contents of intermediate folder: {interm_dir}", 1, verbosity)
+        else:
+            vprint(f"[Clean] Purging intermediate folder: {interm_dir}", 1, verbosity)
+            try:
+                if interm_dir.exists():
+                    shutil.rmtree(interm_dir)
+                interm_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[Clean][Error] Failed to clean intermediates: {e}")
+                sys.exit(2)
+
     # Writable directory pre-checks (skip if dry-run)
     def check_writable(d: Path) -> bool:
         if args.dry_run:
@@ -781,9 +799,14 @@ def main() -> None:
     mips_patched = patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
     t_step2_end = perf_counter()
 
-    vprint("[Step 3] Syncing intermediates -> final (timestamp delta)", 1, verbosity)
-    t_step3 = perf_counter()
-    files_copied = copy_changed(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
+    if args.clean:
+        vprint("[Step 3] Clean mode: full mirror intermediates -> final (bypassing timestamp delta)", 1, verbosity)
+        t_step3 = perf_counter()
+        files_copied = copy_tree(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
+    else:
+        vprint("[Step 3] Syncing intermediates -> final (timestamp delta)", 1, verbosity)
+        t_step3 = perf_counter()
+        files_copied = copy_changed(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
     t_step3_end = perf_counter()
 
     total_elapsed = perf_counter() - t_start
