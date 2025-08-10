@@ -23,13 +23,55 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 
 | Area | What it does |
 |------|--------------|
-| Upscaling | One Real-ESRGAN pass across all dumped textures |
+| Upscaling | Legacy single Real-ESRGAN pass OR new target-based multi-pass iterative scaling |
+| Target Preservation | Preserves tiny textures ≤ `--min-preserve-dim` (default 8) |
+| Iterative Scaling | Applies largest allowed scale from `--scales` list per pass without overshooting `--target-max-dim` |
 | Mip Patching | Highest mip copied onto all lower mip variants (`*-mipN`) |
 | ID Variant Consolidation (optional) | Replaces smaller per-ID textures with perceptually similar larger ones in the same ID group |
 | Similarity Detection (helper script) | Reports visually similar non-mip low-res vs high-res pairs (hash + optional pixel diff) |
 | Safety & Preview | Dry run mode + multi-level verbosity (`-v`, `-vv`, `-vvv`) |
 | Incremental Caching | Only new or updated eligible dumps are (re)upscaled; unchanged intermediates are reused |
 | Clean Rebuild | `--clean` purges intermediates and forces a full upscale + full output mirror |
+
+---
+
+## Target-Based Iterative Upscaling (New)
+
+Define a maximum desired texture dimension (e.g. 2048) and iteratively upscale each image through multiple Real-ESRGAN passes using a list of scale factors until it reaches (but never exceeds) that target. No downsampling occurs.
+
+Key flags:
+* `--target-max-dim N` – Activate iterative mode targeting max dimension N.
+* `--scales 4,2` – Comma list of integer scale factors attempted per pass (default `4,2`). Largest usable factor that keeps the image ≤ target is applied that pass.
+* `--min-preserve-dim 8` – Skip (preserve) textures whose max dimension ≤ this value.
+
+Behavior:
+1. Small preserved textures are copied verbatim.
+2. Remaining candidates cycle through passes. For each scale in order, all images that can be multiplied by that scale without overshoot form a batch for one Real-ESRGAN invocation.
+3. An image stops once it meets or exceeds the target (never reduced) or no listed scale can advance it without overshoot.
+
+Example (target 2048, scales 4,2):
+
+| Original | Pass results | Final |
+|----------|--------------|-------|
+| 256 | 256→1024 (4×) → 1024→2048 (2×) | 2048 |
+| 300 | 300→1200 (4×) (2× would overshoot 2400) | 1200 |
+| 1024 | 1024→2048 (2×; 4× would overshoot) | 2048 |
+| 600 | 600→1200 (2×; 4× overshoot) | 1200 |
+| 8 | preserved | 8 |
+
+Usage:
+```powershell
+# Target 2048 with defaults
+python upscale.py -r <realesrgan> -g <game> --target-max-dim 2048
+
+# Custom cascade (adds scale 3)
+python upscale.py -r <realesrgan> -g <game> --target-max-dim 1536 --scales 4,3,2
+
+# Preserve anything 16px or smaller
+python upscale.py -r <realesrgan> -g <game> --target-max-dim 2048 --min-preserve-dim 16
+```
+
+If `--target-max-dim` is omitted the script performs the legacy single upscale pass on new/updated textures only.
 
 ---
 
@@ -86,6 +128,9 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 | `-i / -m / -o` | Manual input/intermediate/output paths |
 | `-r / --realesrgan` | Real-ESRGAN executable / script or directory |
 | `--realesrgan-args "..."` | Extra args passed through untouched |
+| `--target-max-dim N` | Iteratively upscale toward max dimension N without overshoot |
+| `--scales A,B,...` | Ordered list of scale factors used per pass (default `4,2`) |
+| `--min-preserve-dim N` | Preserve textures with max dim ≤ N (default 8) |
 | `--dry-run` | Simulate all steps (no writes) |
 | `--id-replace` | Enable ID-based small→large texture replacement |
 | `--id-small-threshold N` | Max dimension marking SMALL (default 256) |
@@ -226,6 +271,7 @@ Visual output (when using `--visual-dir`):
 | Pillow import errors | `pip install Pillow` in your active Python environment |
 | Expected file not re-upscaled | Its intermediate timestamp matches source; modify the dump (e.g. re-dump) or run with `--clean` |
 | Replacements not updating | Check if timestamps unchanged due to preservation; use `--clean` for a forced mirror |
+| Image not reaching target | No listed scale can advance it without overshoot; add intermediate scale (e.g. 3) |
 
 ---
 
@@ -234,6 +280,9 @@ Visual output (when using `--visual-dir`):
 | Goal | Command (PowerShell) |
 |------|----------------------|
 | Basic upscale | `python upscale.py -r <realesrgan> -g <game>` |
+| Iterative target 2048 | `python upscale.py -r <realesrgan> -g <game> --target-max-dim 2048` |
+| Iterative target 1536 custom scales | `python upscale.py -r <realesrgan> -g <game> --target-max-dim 1536 --scales 4,3,2` |
+| Preserve tiny <=16px | `python upscale.py -r <realesrgan> -g <game> --target-max-dim 2048 --min-preserve-dim 16` |
 | Include ID replacement | `python upscale.py -r <realesrgan> -g <game> --id-replace` |
 | Dry run preview | `python upscale.py -r <realesrgan> -g <game> --id-replace --dry-run` |
 | Similarity audit (defaults) | `python detect_similar_images.py -g <game>` |

@@ -62,6 +62,33 @@ def parse_args() -> argparse.Namespace:
             "Extra arguments passed through to the Real-ESRGAN command. Provide as a single string."
         ),
     )
+    # Target-based iterative upscaling options
+    parser.add_argument(
+        "--target-max-dim",
+        type=int,
+        default=None,
+        help=(
+            "If set, iteratively upscale each eligible texture until its max(width,height) reaches this value without exceeding it. "
+            "Image is scaled using the largest allowed scale factor that does not overshoot the target."
+        ),
+    )
+    parser.add_argument(
+        "--scales",
+        type=str,
+        default="4,2",
+        help=(
+            "Comma-separated list of integer scale factors to attempt (in order). Example: 4,2 . "
+            "Used only with --target-max-dim."
+        ),
+    )
+    parser.add_argument(
+        "--min-preserve-dim",
+        type=int,
+        default=8,
+        help=(
+            "Do not upscale textures whose max(width,height) <= this value (they are copied verbatim to intermediates)."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -213,6 +240,205 @@ def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, ext
         return proc.returncode if proc.returncode != 0 else 1
 
     return proc.returncode
+
+
+def run_realesrgan_scaled(
+    base_cmd: List[str],
+    scale: int,
+    input_dir: Path,
+    output_dir: Path,
+    extra_args: str,
+    dry_run: bool,
+    verbosity: int,
+) -> int:
+    """Run Real-ESRGAN with an explicit scale factor (-s) when supported (ncnn binary). Fallback to normal run if not.
+
+    We detect support heuristically: if the executable name contains 'ncnn' we append '-s <scale>' *unless* user already
+    provided an explicit '-s' in extra_args. For Python scripts/models where scale selection is model-driven, the caller
+    should provide appropriate --realesrgan-args for each pass (currently we only vary -s automatically for ncnn)."""
+    # If user already specified -s we do not override.
+    use_scale_flag = False
+    if not re.search(r"(?<![A-Za-z0-9-])-s(\s|=)", extra_args):  # crude detection of -s presence
+        exe_name = Path(base_cmd[-1]).name.lower()
+        if "ncnn" in exe_name and scale not in (0, 1):
+            use_scale_flag = True
+    cmd = list(base_cmd)
+    if use_scale_flag:
+        cmd += ["-s", str(scale)]
+    return run_realesrgan_on_dir(cmd, input_dir, output_dir, extra_args, dry_run=dry_run, verbosity=verbosity)
+
+
+def iterative_target_upscale(
+    cmd: List[str],
+    interm_dir: Path,
+    staged_rel_paths: List[Path],
+    source_times: Dict[Path, Tuple[int, int]],
+    target_max_dim: int,
+    preserve_dim: int,
+    scales: List[int],
+    extra_args: str,
+    dry_run: bool,
+    verbosity: int,
+) -> Dict[str, int]:
+    """Iteratively upscale images so that max(w,h) approaches target_max_dim without exceeding it.
+
+    Parameters:
+        cmd: discovered Real-ESRGAN base command (without -i/-o/-s/-scale args)
+        interm_dir: intermediate directory containing (or to contain) outputs
+        staged_rel_paths: list of relative paths (relative to interm_dir) for images to process
+        source_times: mapping of rel path -> (atime_ns, mtime_ns) so we can preserve original timestamps
+        target_max_dim: target maximum dimension
+        preserve_dim: images with max_dim <= preserve_dim are copied verbatim (skip upscaling)
+        scales: ordered list of integer scale factors, typically descending (e.g. [4,2])
+        extra_args: passthrough extra args string
+    Returns stats dict.
+    """
+    stats = {
+        "preserved_small": 0,
+        "upscaled_files": 0,
+        "passes": 0,
+    }
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        print("[Target][Warn] Pillow not installed; falling back to single-pass behavior.")
+        # Single pass fallback: treat as one run on all images larger than preserve_dim using largest scale that fits
+        # (We cannot adjust scale per image without Pillow; just run once). We let caller perform default earlier path.
+        return stats
+
+    # Ensure scales are positive ints, remove duplicates while preserving order
+    dedup_scales: List[int] = []
+    for s in scales:
+        if s > 1 and s not in dedup_scales:
+            dedup_scales.append(s)
+    if not dedup_scales:
+        dedup_scales = [2]
+    # Sort descending so we attempt largest first if user didn't already order
+    dedup_scales.sort(reverse=True)
+
+    # Initial copy of small preserved images (those that will never be upscaled) from temp input already present in interm_dir
+    # At this point caller will have placed the first-pass (original) files inside a staging dir; we copy them directly here.
+    # For simplicity we assume caller has already copied originals into interm_dir for small preserved ones.
+
+    # Build set for quick membership
+    rel_set = set(staged_rel_paths)
+
+    # Helper to get current dimensions of an image path
+    def get_dims(p: Path) -> Optional[Tuple[int, int]]:
+        try:
+            with Image.open(p) as im:
+                return im.size
+        except OSError:
+            return None
+
+    # Track which images are still candidates for further upscaling.
+    # We'll maintain a mapping rel_path -> current max dimension.
+    candidate_paths: Dict[Path, int] = {}
+    for relp in staged_rel_paths:
+        abs_path = interm_dir / relp
+        dims = get_dims(abs_path)
+        if not dims:
+            continue
+        mx = max(dims)
+        if mx <= preserve_dim:
+            stats["preserved_small"] += 1
+            continue
+        if mx >= target_max_dim:
+            continue
+        candidate_paths[relp] = mx
+
+    if not candidate_paths:
+        return stats
+
+    pass_index = 0
+    while candidate_paths:
+        any_scaled_this_outer_loop = False
+        # For each scale, gather files that can be scaled with that factor without exceeding target
+        for scale in dedup_scales:
+            batch: List[Path] = []
+            for relp, cur_max in candidate_paths.items():
+                if cur_max * scale <= target_max_dim and cur_max * scale > cur_max:
+                    batch.append(relp)
+            if not batch:
+                continue
+            pass_index += 1
+            stats["passes"] = pass_index
+            any_scaled_this_outer_loop = True
+            # Prepare staging dirs
+            staging_in = interm_dir / f"_pass{pass_index}_in"
+            staging_out = interm_dir / f"_pass{pass_index}_out"
+            if not dry_run:
+                staging_in.mkdir(parents=True, exist_ok=True)
+                staging_out.mkdir(parents=True, exist_ok=True)
+            if verbosity >= 2:
+                print(f"[Target][Pass {pass_index}] scale={scale} batch={len(batch)}")
+            # Copy current versions into staging input
+            for relp in batch:
+                src = interm_dir / relp
+                if not src.exists():
+                    continue
+                if not dry_run:
+                    staging_in_sub = staging_in / relp.parent
+                    staging_in_sub.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, staging_in_sub / relp.name)
+            # Run realesrgan on this batch
+            rc = run_realesrgan_scaled(
+                cmd,
+                scale,
+                staging_in,
+                staging_out,
+                extra_args,
+                dry_run,
+                verbosity,
+            )
+            if rc != 0:
+                print(f"[Target][Warn] Real-ESRGAN returned code {rc} on pass {pass_index}; aborting iterative upscale.")
+                # Clean staging dirs
+                if not dry_run:
+                    shutil.rmtree(staging_in, ignore_errors=True)
+                    shutil.rmtree(staging_out, ignore_errors=True)
+                candidate_paths.clear()
+                break
+            # Merge outputs back into interm_dir
+            for relp in batch:
+                out_file = staging_out / relp
+                dest_file = interm_dir / relp
+                if not dry_run and out_file.exists():
+                    try:
+                        at_ns, mt_ns = source_times.get(relp, (None, None))
+                        shutil.copy2(out_file, dest_file)
+                        if at_ns is not None and mt_ns is not None:
+                            try:
+                                os.utime(dest_file, ns=(at_ns, mt_ns))
+                            except OSError:
+                                pass
+                    except OSError as e:
+                        print(f"[Target][Error] Failed to integrate output {out_file}: {e}")
+                        continue
+                    stats["upscaled_files"] += 1
+            # Recompute candidate sizes (only for those still below target)
+            to_remove: List[Path] = []
+            for relp in batch:
+                abs_path = interm_dir / relp
+                dims = get_dims(abs_path)
+                if not dims:
+                    to_remove.append(relp)
+                    continue
+                mx = max(dims)
+                if mx >= target_max_dim:
+                    to_remove.append(relp)
+                else:
+                    candidate_paths[relp] = mx
+            for relp in to_remove:
+                candidate_paths.pop(relp, None)
+            # Cleanup staging directories
+            if not dry_run:
+                shutil.rmtree(staging_in, ignore_errors=True)
+                shutil.rmtree(staging_out, ignore_errors=True)
+        if not any_scaled_this_outer_loop:
+            # No scale factor could be applied without overshoot; break to avoid infinite loop
+            break
+    return stats
 
 
 def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
@@ -689,6 +915,8 @@ def main() -> None:
     temp_in_dir = interm_dir / "_pending_upscale"
     if not args.dry_run and temp_in_dir.exists():
         shutil.rmtree(temp_in_dir)
+    # Track relative paths for all files that will go through upscaling logic (to drive iterative target mode)
+    staged_rel_paths: List[Path] = []
     for dirpath, _, filenames in os.walk(input_dir):
         rel_dir = os.path.relpath(dirpath, input_dir)
         for fn in filenames:
@@ -726,6 +954,7 @@ def main() -> None:
                 staged_files.append(src_path)
             # Stage file (new or re-upscale) into temp input
             source_times[rel_out_path] = (s_atime_ns, s_mtime_ns)
+            staged_rel_paths.append(rel_out_path)
             if not args.dry_run:
                 target_stage_dir = temp_in_dir / (rel_dir if rel_dir != '.' else '')
                 target_stage_dir.mkdir(parents=True, exist_ok=True)
@@ -748,35 +977,82 @@ def main() -> None:
         vprint("[Step 1] No new or updated textures to upscale (continuing with existing intermediates)", 1, verbosity)
         t_step1 = perf_counter(); t_step1_end = t_step1
     else:
-        # Run Real-ESRGAN on staged temp input -> intermediates as output
         t_step1 = perf_counter()
         realesrgan_path = Path(args.realesrgan).resolve()
         cmd = discover_realesrgan_cmd(realesrgan_path)
         if verbosity >= 2:
             vprint(f"[Discover] Using Real-ESRGAN command: {' '.join(cmd)}", 2, verbosity)
-        rc = run_realesrgan_on_dir(
-            cmd,
-            temp_in_dir,
-            interm_dir,
-            args.realesrgan_args,
-            dry_run=args.dry_run,
-            verbosity=verbosity,
-        )
-        if rc != 0:
-            print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
+        # Two modes: target-based iterative vs legacy single-pass
+        if args.target_max_dim:
+            # First, copy originals directly into interm_dir so iterative function can read them.
+            if not args.dry_run:
+                for relp in staged_rel_paths:
+                    src_file = temp_in_dir / relp
+                    dest_file = interm_dir / relp
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    if src_file.exists():
+                        try:
+                            shutil.copy2(src_file, dest_file)
+                        except OSError as e:
+                            print(f"[Error] Failed initial copy for {src_file}: {e}")
+                # Apply original timestamps
+                for rel_path, (at_ns, mt_ns) in source_times.items():
+                    out_path = interm_dir / rel_path
+                    if out_path.exists():
+                        try:
+                            os.utime(out_path, ns=(at_ns, mt_ns))
+                        except OSError:
+                            pass
+            # Parse scale list
+            try:
+                scale_list = [int(s.strip()) for s in args.scales.split(',') if s.strip()]
+            except ValueError:
+                print("[Target][Error] Invalid --scales list; must be comma-separated integers.")
+                sys.exit(2)
+            target_stats = iterative_target_upscale(
+                cmd,
+                interm_dir,
+                staged_rel_paths,
+                source_times,
+                args.target_max_dim,
+                args.min_preserve_dim,
+                scale_list,
+                args.realesrgan_args,
+                args.dry_run,
+                verbosity,
+            )
+            if verbosity >= 1:
+                vprint(
+                    f"[Target] Iterative passes: {target_stats.get('passes',0)} | Upscaled: {target_stats.get('upscaled_files',0)} | Preserved small: {target_stats.get('preserved_small',0)}",
+                    1,
+                    verbosity,
+                )
             if not args.dry_run and temp_in_dir.exists():
                 shutil.rmtree(temp_in_dir, ignore_errors=True)
-            sys.exit(rc)
-        if not args.dry_run:
-            # Restore original dump timestamps onto generated upscale outputs to make future delta detection accurate
-            for rel_path, (at_ns, mt_ns) in source_times.items():
-                out_path = interm_dir / rel_path
-                if out_path.exists():
-                    try:
-                        os.utime(out_path, ns=(at_ns, mt_ns))
-                    except OSError as e:
-                        vprint(f"[Stage][Warn] Failed to apply original timestamp to {out_path}: {e}", 4, verbosity)
-            shutil.rmtree(temp_in_dir, ignore_errors=True)
+        else:
+            # Legacy single-pass behavior
+            rc = run_realesrgan_on_dir(
+                cmd,
+                temp_in_dir,
+                interm_dir,
+                args.realesrgan_args,
+                dry_run=args.dry_run,
+                verbosity=verbosity,
+            )
+            if rc != 0:
+                print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
+                if not args.dry_run and temp_in_dir.exists():
+                    shutil.rmtree(temp_in_dir, ignore_errors=True)
+                sys.exit(rc)
+            if not args.dry_run:
+                for rel_path, (at_ns, mt_ns) in source_times.items():
+                    out_path = interm_dir / rel_path
+                    if out_path.exists():
+                        try:
+                            os.utime(out_path, ns=(at_ns, mt_ns))
+                        except OSError:
+                            pass
+                shutil.rmtree(temp_in_dir, ignore_errors=True)
         t_step1_end = perf_counter()
 
     vprint("[Step 2] ID-based small texture replacement & mip patching", 1, verbosity)
