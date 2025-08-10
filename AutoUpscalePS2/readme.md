@@ -28,6 +28,8 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 | ID Variant Consolidation (optional) | Replaces smaller per-ID textures with perceptually similar larger ones in the same ID group |
 | Similarity Detection (helper script) | Reports visually similar non-mip low-res vs high-res pairs (hash + optional pixel diff) |
 | Safety & Preview | Dry run mode + multi-level verbosity (`-v`, `-vv`, `-vvv`) |
+| Incremental Caching | Only new or updated eligible dumps are (re)upscaled; unchanged intermediates are reused |
+| Clean Rebuild | `--clean` purges intermediates and forces a full upscale + full output mirror |
 
 ---
 
@@ -90,6 +92,7 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 | `--id-large-threshold N` | Min dimension marking LARGE (default 256) |
 | `--id-hash-size S` | aHash size 4–16 (default 8) |
 | `--id-hash-threshold D` | Max Hamming distance to allow replacement (default 6) |
+| `-c / --clean` | Purge intermediates (full rebuild) & force full output mirror |
 
 ---
 
@@ -114,6 +117,52 @@ python upscale.py -r <realesrgan> -g <game_path> --id-replace \
 	--id-small-threshold 256 --id-large-threshold 512 \
 	--id-hash-size 8 --id-hash-threshold 8 -vv
 ```
+
+---
+
+## Filename Eligibility Filter (Dash Rule)
+
+The pipeline globally ignores any texture whose filename stem (without extension) contains fewer than two dashes. A valid eligible stem must have at least three dash‑separated segments, e.g.:
+
+Eligible: `foo-123-bar.png`, `abc-045-texture-mip0.png`
+
+Ignored: `singlepart.png`, `foo-123.png` (only one dash)
+
+Rationale: Ensures a stable second segment (the numeric/ID token) for grouping, avoiding accidental cross‑pollination of unrelated textures and reducing noise in incremental detection.
+
+This filter applies to every stage: staging for upscale, ID replacement, mip patching, and final copy.
+
+---
+
+## Incremental Pipeline, Caching & Clean Mode
+
+The workflow is designed to be fast after the first run:
+
+1. Scan `dumps/` for eligible files. Each eligible file is classified as:
+	* New: No corresponding file yet in `intermediates/`.
+	* Updated: Source dump mtime newer than the existing intermediate copy (file was re-dumped or changed).
+	* Up‑to‑date: Intermediate is current (skipped).
+2. Only New + Updated are copied into a temporary staging folder `_pending_upscale/` and passed to Real-ESRGAN. Other intermediates remain untouched and reused.
+3. After a successful upscale pass the original dump timestamps are restored onto the newly produced intermediate outputs so future runs perform accurate delta checks without being confused by processing time.
+4. ID replacement (if enabled) and mip patching operate in‑place while preserving existing modification timestamps for overwritten targets (so a patched file that did not logically change does not trigger unnecessary downstream copies).
+5. Final sync to `replacements/` uses timestamp comparison (`copy_changed`) so only genuinely new/updated files copy over.
+
+Clean Mode (`--clean`):
+* Purges the entire `intermediates/` folder before scanning.
+* Forces every eligible dump to be treated as New (full re-upscale).
+* Final Step 3 uses a full mirror copy (not timestamp delta) to guarantee `replacements/` exactly matches the rebuilt intermediates.
+
+When to use `--clean`:
+* After changing upscale models/parameters.
+* If you suspect stale intermediates.
+* After upgrading the script in a way that alters processing (e.g., different mip logic).
+
+Otherwise prefer incremental runs—they are much faster when only a handful of new textures were dumped.
+
+Timestamp Preservation Details:
+* Newly upscaled intermediates adopt the original dump file's access & modification times.
+* ID replacement and mip patch overwrites restore the previous destination timestamps after content write, minimizing spurious "changed" signals.
+* Final delta copy relies purely on modification timestamps; if you manually edit a replacement and want it regenerated, either touch the source dump (so mtime increases) or run with `--clean`.
 
 ---
 
@@ -175,6 +224,8 @@ Visual output (when using `--visual-dir`):
 | Few ID replacements | Increase `--id-hash-threshold` or lower small/large thresholds; confirm groupings with `-vv` |
 | Incorrect replacements | Lower threshold or raise `--id-hash-size`; inspect with dry run first |
 | Pillow import errors | `pip install Pillow` in your active Python environment |
+| Expected file not re-upscaled | Its intermediate timestamp matches source; modify the dump (e.g. re-dump) or run with `--clean` |
+| Replacements not updating | Check if timestamps unchanged due to preservation; use `--clean` for a forced mirror |
 
 ---
 
