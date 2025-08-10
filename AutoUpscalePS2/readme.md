@@ -145,7 +145,7 @@ The workflow is designed to be fast after the first run:
 2. Only New + Updated are copied into a temporary staging folder `_pending_upscale/` and passed to Real-ESRGAN. Other intermediates remain untouched and reused.
 3. After a successful upscale pass the original dump timestamps are restored onto the newly produced intermediate outputs so future runs perform accurate delta checks without being confused by processing time.
 4. ID replacement (if enabled) and mip patching operate in‑place while preserving existing modification timestamps for overwritten targets (so a patched file that did not logically change does not trigger unnecessary downstream copies).
-5. Final sync to `replacements/` uses timestamp comparison (`copy_changed`) so only genuinely new/updated files copy over.
+5. Final sync to `replacements/` uses timestamp comparison so only genuinely new/updated files copy over.
 
 Clean Mode (`--clean`):
 * Purges the entire `intermediates/` folder before scanning.
