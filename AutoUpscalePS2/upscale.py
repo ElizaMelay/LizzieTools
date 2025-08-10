@@ -181,19 +181,17 @@ def run_realesrgan_on_dir(cmd: List[str], input_dir: Path, output_dir: Path, ext
         if not proc.stdout:
             return
         for line in proc.stdout:
-            if verbosity >= 3:
-                print(line.rstrip())
+            vprint(line.rstrip(), 3, verbosity)
 
     def read_stderr():
         if not proc.stderr:
             return
         for line in proc.stderr:
             ls = line.strip()
-            # We purposely do NOT treat percentage or other non-keyword lines as errors
             if any(kw in ls.lower() for kw in error_keywords):
                 keyword_hits.append(line.rstrip())
-            elif verbosity >= 4:  # ultra-verbose raw stderr
-                print(f"[Real-ESRGAN stderr] {ls}")
+            else:
+                vprint(f"[Real-ESRGAN stderr] {ls}", 4, verbosity)
 
     t_out = threading.Thread(target=read_stdout)
     t_err = threading.Thread(target=read_stderr)
@@ -286,8 +284,7 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
                         try:
                             os.utime(dst_path, ns=preserve_times)
                         except OSError as e2:
-                            if verbosity >= 4:
-                                print(f"[Mips][Warn] Failed to restore timestamp on {dst_path}: {e2}")
+                            vprint(f"[Mips][Warn] Failed to restore timestamp on {dst_path}: {e2}", 4, verbosity)
                 except PermissionError:
                     msg = f"[Error] Permission denied while overwriting mip file: {dst_path} (is it read-only?)"
                     print(msg)
@@ -362,8 +359,7 @@ def copy_changed(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0
                 msg = f"[Error] Cannot stat source file {sfile}: {e}"
                 if errors is not None:
                     errors.append(msg)
-                if verbosity >= 2:
-                    print(msg)
+                vprint(msg, 2, verbosity)
                 continue
             needs_copy = True
             if dfile.exists():
@@ -374,8 +370,7 @@ def copy_changed(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0
                 except OSError:
                     needs_copy = True
             if not needs_copy:
-                if verbosity >= 4:
-                    print(f"[CopyΔ][Skip] {dfile} (timestamps equal)")
+                vprint(f"[CopyΔ][Skip] {dfile} (timestamps equal)", 4, verbosity)
                 continue
             vprint(f"[CopyΔ] {sfile} -> {dfile}", 3, verbosity)
             if not dry_run:
@@ -456,8 +451,7 @@ def replace_small_id_variants(
                 return bits
         except OSError as e:
             msg = f"[IDReplace][Warn] Cannot hash {path}: {e}"
-            if verbosity >= 3:
-                print(msg)
+            vprint(msg, 3, verbosity)
             if errors is not None:
                 errors.append(msg)
             return None
@@ -479,8 +473,7 @@ def replace_small_id_variants(
                 continue
             # Require at least two dashes in the stem (three segments) so we have a stable middle ID segment.
             if stem.count('-') < 2:
-                if verbosity >= 4:
-                    print(f"[IDReplace][SkipDash] {stem} (needs >=2 dashes)")
+                vprint(f"[IDReplace][SkipDash] {stem} (needs >=2 dashes)", 4, verbosity)
                 continue
             parts = stem.split('-')  # now guaranteed len(parts) >= 3
             key = parts[1]
@@ -490,8 +483,7 @@ def replace_small_id_variants(
                     w, h = im.size
             except OSError as e:
                 msg = f"[IDReplace][Warn] Cannot open {full_path}: {e}"
-                if verbosity >= 3:
-                    print(msg)
+                vprint(msg, 3, verbosity)
                 if errors is not None:
                     errors.append(msg)
                 continue
@@ -541,8 +533,7 @@ def replace_small_id_variants(
             dist, best_path, bw, bh = best_candidate
             if dist > SIM_HASH_THRESHOLD:
                 similarity_skips += 1
-                if verbosity >= 3:
-                    print(f"[IDReplace] Skip (not similar) {small_path.name} vs {best_path.name} hamming={dist} > {SIM_HASH_THRESHOLD}")
+                vprint(f"[IDReplace] Skip (not similar) {small_path.name} vs {best_path.name} hamming={dist} > {SIM_HASH_THRESHOLD}", 3, verbosity)
                 continue
             vprint(
                 f"[IDReplace] {small_path.name} ({sw}x{sh}) <- {best_path.name} ({bw}x{bh}) [key={key}] hamming={dist}",
@@ -562,8 +553,7 @@ def replace_small_id_variants(
                         try:
                             os.utime(small_path, ns=preserve_times)
                         except OSError as e2:
-                            if verbosity >= 4:
-                                print(f"[IDReplace][Warn] Failed to restore timestamp on {small_path}: {e2}")
+                            vprint(f"[IDReplace][Warn] Failed to restore timestamp on {small_path}: {e2}", 4, verbosity)
                 except PermissionError:
                     msg = f"[IDReplace][Error] Permission denied overwriting {small_path}"
                     print(msg)
@@ -700,8 +690,7 @@ def main() -> None:
                 s_atime_ns = getattr(s_stat, 'st_atime_ns', int(s_stat.st_atime*1e9))
                 s_mtime_ns = getattr(s_stat, 'st_mtime_ns', int(s_stat.st_mtime*1e9))
             except OSError as e:
-                if verbosity >= 2:
-                    print(f"[Stage][Warn] Cannot stat source {src_path}: {e}")
+                vprint(f"[Stage][Warn] Cannot stat source {src_path}: {e}", 2, verbosity)
                 continue
             if dest_path.exists():
                 try:
@@ -713,8 +702,7 @@ def main() -> None:
                     reupscale_files.append(src_path)
                 else:
                     skipped_existing += 1
-                    if verbosity >= 4:
-                        print(f"[Stage][SkipUpToDate] {dest_path}")
+                    vprint(f"[Stage][SkipUpToDate] {dest_path}", 4, verbosity)
                     continue
             else:
                 staged_files.append(src_path)
@@ -729,8 +717,8 @@ def main() -> None:
                     msg = f"[Error] Failed staging {src_path}: {e.strerror or e}"
                     print(msg)
                     continue
-            if verbosity >= 3:
-                kind = "Updated" if rel_out_path in source_times and src_path in reupscale_files else "New"
+            if verbosity >= 3:  # avoid computing kind & membership checks unless we'll log
+                kind = "Updated" if src_path in reupscale_files else "New"
                 vprint(f"[Stage] {kind} {src_path}", 3, verbosity)
     vprint(
         f"  New: {len(staged_files)} | Updated: {len(reupscale_files)} | Up-to-date skipped: {skipped_existing} | Ineligible skipped: {skipped_ineligible}",
@@ -769,8 +757,7 @@ def main() -> None:
                     try:
                         os.utime(out_path, ns=(at_ns, mt_ns))
                     except OSError as e:
-                        if verbosity >= 4:
-                            print(f"[Stage][Warn] Failed to apply original timestamp to {out_path}: {e}")
+                        vprint(f"[Stage][Warn] Failed to apply original timestamp to {out_path}: {e}", 4, verbosity)
             shutil.rmtree(temp_in_dir, ignore_errors=True)
         t_step1_end = perf_counter()
 
