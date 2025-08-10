@@ -274,9 +274,21 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
             vprint(f"[Mips] Overwrite {dst_path.name} with {src_path.name}", 2, verbosity)
             total_overwrites += 1
             if not dry_run:
+                # Preserve existing destination timestamps to avoid triggering downstream sync each run
                 try:
+                    try:
+                        dst_stat = dst_path.stat()
+                        preserve_times = (getattr(dst_stat, 'st_atime_ns', int(dst_stat.st_atime*1e9)), getattr(dst_stat, 'st_mtime_ns', int(dst_stat.st_mtime*1e9)))
+                    except FileNotFoundError:
+                        preserve_times = None
                     shutil.copyfile(src_path, dst_path)
-                except PermissionError as e:
+                    if preserve_times is not None:
+                        try:
+                            os.utime(dst_path, ns=preserve_times)
+                        except OSError as e2:
+                            if verbosity >= 4:
+                                print(f"[Mips][Warn] Failed to restore timestamp on {dst_path}: {e2}")
+                except PermissionError:
                     msg = f"[Error] Permission denied while overwriting mip file: {dst_path} (is it read-only?)"
                     print(msg)
                     if errors is not None:
@@ -326,6 +338,67 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, e
     else:
         vprint(f"  Copied {copied_count} files.", 1, verbosity)
     return copied_count
+
+
+def copy_changed(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, errors: Optional[List[str]] = None) -> int:
+    """Copy only files whose modification timestamp differs or that do not exist in destination.
+
+    Uses nanosecond resolution where available. Skips copy if destination exists and mtime_ns matches.
+    Returns number of files actually copied.
+    """
+    vprint(f"[CopyΔ] Syncing {src} -> {dst} (timestamp-based)", 3, verbosity)
+    copied = 0
+    for dirpath, _, filenames in os.walk(src):
+        rel = os.path.relpath(dirpath, src)
+        out_dir = dst / rel if rel != '.' else dst
+        if not dry_run:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        for fn in filenames:
+            sfile = Path(dirpath) / fn
+            dfile = out_dir / fn
+            try:
+                s_stat = sfile.stat()
+            except OSError as e:
+                msg = f"[Error] Cannot stat source file {sfile}: {e}"
+                if errors is not None:
+                    errors.append(msg)
+                if verbosity >= 2:
+                    print(msg)
+                continue
+            needs_copy = True
+            if dfile.exists():
+                try:
+                    d_stat = dfile.stat()
+                    if getattr(d_stat, 'st_mtime_ns', int(d_stat.st_mtime*1e9)) == getattr(s_stat, 'st_mtime_ns', int(s_stat.st_mtime*1e9)):
+                        needs_copy = False
+                except OSError:
+                    needs_copy = True
+            if not needs_copy:
+                if verbosity >= 4:
+                    print(f"[CopyΔ][Skip] {dfile} (timestamps equal)")
+                continue
+            vprint(f"[CopyΔ] {sfile} -> {dfile}", 3, verbosity)
+            if not dry_run:
+                try:
+                    shutil.copy2(sfile, dfile)
+                except PermissionError:
+                    msg = f"[Error] Permission denied copying to: {dfile}"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
+                except OSError as e:
+                    msg = f"[Error] Failed to copy {sfile} -> {dfile}: {e.strerror or e}"
+                    print(msg)
+                    if errors is not None:
+                        errors.append(msg)
+                    continue
+            copied += 1
+    if dry_run:
+        vprint(f"  Would have copied/updated {copied} files (dry run).", 1, verbosity)
+    else:
+        vprint(f"  Copied/updated {copied} files (timestamp delta).", 1, verbosity)
+    return copied
 
 
 def replace_small_id_variants(
@@ -477,8 +550,20 @@ def replace_small_id_variants(
                 verbosity,
             )
             if not dry_run:
+                # Preserve original destination (small_path) timestamps after content replacement
                 try:
+                    try:
+                        dst_stat = small_path.stat()
+                        preserve_times = (getattr(dst_stat, 'st_atime_ns', int(dst_stat.st_atime*1e9)), getattr(dst_stat, 'st_mtime_ns', int(dst_stat.st_mtime*1e9)))
+                    except FileNotFoundError:
+                        preserve_times = None
                     shutil.copy2(best_path, small_path)
+                    if preserve_times is not None:
+                        try:
+                            os.utime(small_path, ns=preserve_times)
+                        except OSError as e2:
+                            if verbosity >= 4:
+                                print(f"[IDReplace][Warn] Failed to restore timestamp on {small_path}: {e2}")
                 except PermissionError:
                     msg = f"[IDReplace][Error] Permission denied overwriting {small_path}"
                     print(msg)
@@ -586,10 +671,16 @@ def main() -> None:
     if not check_writable(interm_dir) or not check_writable(output_dir):
         sys.exit(2)
 
-    # Step 1A: Filter + copy eligible images (>=2 dashes) to intermediate first
-    vprint("[Step 1] Filtering & copying eligible textures (>=2 dashes) to intermediate", 1, verbosity)
-    eligible_files: List[Path] = []
-    skipped_dash = 0
+    # Step 1: Determine new eligible inputs and stage them for upscaling
+    vprint("[Step 1] Scanning input for new eligible textures (>=2 dashes)", 1, verbosity)
+    staged_files: List[Path] = []  # Newly seen (no prior intermediate)
+    reupscale_files: List[Path] = []  # Source newer than existing intermediate -> re-upscale
+    skipped_existing = 0  # Existing and up-to-date
+    skipped_ineligible = 0
+    source_times: Dict[Path, Tuple[int, int]] = {}  # rel path -> (atime_ns, mtime_ns) from original dump
+    temp_in_dir = interm_dir / "_pending_upscale"
+    if not args.dry_run and temp_in_dir.exists():
+        shutil.rmtree(temp_in_dir)
     for dirpath, _, filenames in os.walk(input_dir):
         rel_dir = os.path.relpath(dirpath, input_dir)
         for fn in filenames:
@@ -599,62 +690,89 @@ def main() -> None:
                 continue
             stem = src_path.stem
             if not is_eligible_filename(stem):
-                skipped_dash += 1
+                skipped_ineligible += 1
                 continue
-            eligible_files.append(src_path)
-            if not args.dry_run:
-                out_dir = interm_dir / (rel_dir if rel_dir != '.' else '')
-                out_dir.mkdir(parents=True, exist_ok=True)
+            rel_target_dir = interm_dir / (rel_dir if rel_dir != '.' else '')
+            dest_path = rel_target_dir / fn
+            rel_out_path = (Path(rel_dir) / fn) if rel_dir != '.' else Path(fn)
+            try:
+                s_stat = src_path.stat()
+                s_atime_ns = getattr(s_stat, 'st_atime_ns', int(s_stat.st_atime*1e9))
+                s_mtime_ns = getattr(s_stat, 'st_mtime_ns', int(s_stat.st_mtime*1e9))
+            except OSError as e:
+                if verbosity >= 2:
+                    print(f"[Stage][Warn] Cannot stat source {src_path}: {e}")
+                continue
+            if dest_path.exists():
                 try:
-                    shutil.copy2(src_path, out_dir / fn)
+                    d_stat = dest_path.stat()
+                    d_mtime_ns = getattr(d_stat, 'st_mtime_ns', int(d_stat.st_mtime*1e9))
+                except OSError:
+                    d_mtime_ns = -1
+                if s_mtime_ns > d_mtime_ns:  # Source updated since last upscale
+                    reupscale_files.append(src_path)
+                else:
+                    skipped_existing += 1
+                    if verbosity >= 4:
+                        print(f"[Stage][SkipUpToDate] {dest_path}")
+                    continue
+            else:
+                staged_files.append(src_path)
+            # Stage file (new or re-upscale) into temp input
+            source_times[rel_out_path] = (s_atime_ns, s_mtime_ns)
+            if not args.dry_run:
+                target_stage_dir = temp_in_dir / (rel_dir if rel_dir != '.' else '')
+                target_stage_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(src_path, target_stage_dir / fn)
                 except OSError as e:
-                    msg = f"[Error] Failed to copy eligible file {src_path} -> {out_dir / fn}: {e.strerror or e}"
+                    msg = f"[Error] Failed staging {src_path}: {e.strerror or e}"
                     print(msg)
                     continue
             if verbosity >= 3:
-                vprint(f"[Filter] Keep {src_path}", 3, verbosity)
-    if not eligible_files:
-        print("[Info] No eligible input images (need >=2 dashes in name). Nothing to do.")
-        return
-    vprint(f"  Eligible images: {len(eligible_files)} (skipped for dash rule: {skipped_dash})", 1, verbosity)
-
-    # Step 1B: Upscale the intermediate folder into a temp dir, then merge back
-    temp_up_dir = interm_dir.parent / (interm_dir.name + "_upscaled_tmp")
-    if not args.dry_run:
-        if temp_up_dir.exists():
-            # Clean stale temp
-            shutil.rmtree(temp_up_dir)
-        temp_up_dir.mkdir(parents=True, exist_ok=True)
-
-    t_step1 = perf_counter()
-    realesrgan_path = Path(args.realesrgan).resolve()
-    cmd = discover_realesrgan_cmd(realesrgan_path)
-    if verbosity >= 2:
-        vprint(f"[Discover] Using Real-ESRGAN command: {' '.join(cmd)}", 2, verbosity)
-    # Run ESRGAN: input=interm_dir (filtered copies), output=temp_up_dir
-    rc = run_realesrgan_on_dir(cmd, interm_dir, temp_up_dir, args.realesrgan_args, dry_run=args.dry_run, verbosity=verbosity)
-    if rc != 0:
-        print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
-        # Clean temp if created
-        if not args.dry_run and temp_up_dir.exists():
-            shutil.rmtree(temp_up_dir, ignore_errors=True)
-        sys.exit(rc)
-    # Merge upscaled results back into interm_dir
-    if not args.dry_run:
-        for dirpath, _, filenames in os.walk(temp_up_dir):
-            rel = os.path.relpath(dirpath, temp_up_dir)
-            target_dir = interm_dir / (rel if rel != '.' else '')
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for fn in filenames:
-                src_f = Path(dirpath) / fn
-                dst_f = target_dir / fn
-                try:
-                    shutil.move(str(src_f), str(dst_f))
-                except OSError as e:
-                    print(f"[Error] Failed moving upscaled {src_f} -> {dst_f}: {e.strerror or e}")
-        # Remove empty temp dir
-        shutil.rmtree(temp_up_dir, ignore_errors=True)
-    t_step1_end = perf_counter()
+                kind = "Updated" if rel_out_path in source_times and src_path in reupscale_files else "New"
+                vprint(f"[Stage] {kind} {src_path}", 3, verbosity)
+    vprint(
+        f"  New: {len(staged_files)} | Updated: {len(reupscale_files)} | Up-to-date skipped: {skipped_existing} | Ineligible skipped: {skipped_ineligible}",
+        1,
+        verbosity,
+    )
+    total_to_process = len(staged_files) + len(reupscale_files)
+    if total_to_process == 0:
+        vprint("[Step 1] No new or updated textures to upscale (continuing with existing intermediates)", 1, verbosity)
+        t_step1 = perf_counter(); t_step1_end = t_step1
+    else:
+        # Run Real-ESRGAN on staged temp input -> intermediates as output
+        t_step1 = perf_counter()
+        realesrgan_path = Path(args.realesrgan).resolve()
+        cmd = discover_realesrgan_cmd(realesrgan_path)
+        if verbosity >= 2:
+            vprint(f"[Discover] Using Real-ESRGAN command: {' '.join(cmd)}", 2, verbosity)
+        rc = run_realesrgan_on_dir(
+            cmd,
+            temp_in_dir,
+            interm_dir,
+            args.realesrgan_args,
+            dry_run=args.dry_run,
+            verbosity=verbosity,
+        )
+        if rc != 0:
+            print("[Warning] Real-ESRGAN returned a non-zero exit code or error output. Check the command and paths.")
+            if not args.dry_run and temp_in_dir.exists():
+                shutil.rmtree(temp_in_dir, ignore_errors=True)
+            sys.exit(rc)
+        if not args.dry_run:
+            # Restore original dump timestamps onto generated upscale outputs to make future delta detection accurate
+            for rel_path, (at_ns, mt_ns) in source_times.items():
+                out_path = interm_dir / rel_path
+                if out_path.exists():
+                    try:
+                        os.utime(out_path, ns=(at_ns, mt_ns))
+                    except OSError as e:
+                        if verbosity >= 4:
+                            print(f"[Stage][Warn] Failed to apply original timestamp to {out_path}: {e}")
+            shutil.rmtree(temp_in_dir, ignore_errors=True)
+        t_step1_end = perf_counter()
 
     vprint("[Step 2] ID-based small texture replacement & mip patching", 1, verbosity)
     t_step2 = perf_counter()
@@ -676,9 +794,9 @@ def main() -> None:
     mips_patched = patch_mips_in_place(interm_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
     t_step2_end = perf_counter()
 
-    vprint("[Step 3] Copying upscaled textures to final output folder", 1, verbosity)
+    vprint("[Step 3] Syncing intermediates -> final (timestamp delta)", 1, verbosity)
     t_step3 = perf_counter()
-    files_copied = copy_tree(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
+    files_copied = copy_changed(interm_dir, output_dir, dry_run=args.dry_run, verbosity=verbosity, errors=errors)
     t_step3_end = perf_counter()
 
     total_elapsed = perf_counter() - t_start
@@ -691,7 +809,7 @@ def main() -> None:
             step1_time = t_step1_end - t_step1
             step2_time = t_step2_end - t_step2
             step3_time = t_step3_end - t_step3
-            print(f"  Eligible input images: {len(eligible_files)} - upscaled in {step1_time:.2f}s")
+            print(f"  Upscaled images - new: {len(staged_files)} updated: {len(reupscale_files)} (total {total_to_process}) - processed in {step1_time:.2f}s")
             if args.id_replace:
                 print(f"  Mips patched: {mips_patched} (ID replacements: {id_replacements}) - processed in {step2_time:.2f}s")
             else:
