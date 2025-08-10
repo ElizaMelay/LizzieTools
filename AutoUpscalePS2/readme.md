@@ -26,6 +26,7 @@ Upscaled textures appear in `replacements/` for PCSX2 to load (ensure PCSX2 "Loa
 | Upscaling | One Real-ESRGAN pass across all dumped textures |
 | Mip Patching | Highest mip copied onto all lower mip variants (`*-mipN`) |
 | ID Variant Consolidation (optional) | Replaces smaller per-ID textures with perceptually similar larger ones in the same ID group |
+| Optional Second Pass (size range) | Re-upscales newly processed textures whose max dimension lies within a specified min/max range |
 | Similarity Detection (helper script) | Reports visually similar non-mip low-res vs high-res pairs (hash + optional pixel diff) |
 | Safety & Preview | Dry run mode + multi-level verbosity (`-v`, `-vv`, `-vvv`) |
 | Incremental Caching | Only new or updated eligible dumps are (re)upscaled; unchanged intermediates are reused |
@@ -93,6 +94,11 @@ You may override with explicit `-i -m -o` paths instead of `-g`.
 | `--id-hash-size S` | aHash size 4–16 (default 8) |
 | `--id-hash-threshold D` | Max Hamming distance to allow replacement (default 6) |
 | `-c / --clean` | Purge intermediates (full rebuild) & force full output mirror |
+| `--double-upscale-small` | Enable a second Real-ESRGAN pass for qualifying sizes |
+| `--double-upscale-min-size N` | Minimum max(width,height) (inclusive) for second pass (default 128) |
+| `--double-upscale-max-size N` | Maximum max(width,height) (inclusive) for second pass (default 512) |
+| `--double-upscale-extra-args "..."` | Extra args only for second pass (inherits `--realesrgan-args` if omitted) |
+| `--double-upscale-max-result N` | Cap final max(width,height) after second pass (0 disables; default 1024; oversized outputs are downscaled) |
 
 ---
 
@@ -116,6 +122,49 @@ Example:
 python upscale.py -r <realesrgan> -g <game_path> --id-replace \
 	--id-small-threshold 256 --id-large-threshold 512 \
 	--id-hash-size 8 --id-hash-threshold 8 -vv
+```
+
+## Optional Second-Pass Double Upscaling
+
+Run Real-ESRGAN a second time on only the NEW/UPDATED textures from this run whose maximum dimension is within a specified range. Useful for pushing extra detail into mid-size assets (e.g. 128–256) without reprocessing large textures.
+
+How it works:
+1. First pass runs on staged new/updated dumps.
+2. Newly produced intermediates are scanned; those with `min_size <= max(width,height) <= max_size` are restaged.
+3. Second pass overwrites just those intermediates (timestamps restored again for incremental accuracy).
+
+Key flags:
+* `--double-upscale-small` (enable feature)
+* `--double-upscale-min-size` / `--double-upscale-max-size` (inclusive bounds)
+* `--double-upscale-extra-args` (args only for second pass; falls back to `--realesrgan-args` if empty)
+* `--double-upscale-max-result` (optional post-pass size cap; downscales any second-pass result whose max dimension exceeds this, preserving aspect)
+
+Example (second pass for 128–256):
+```powershell
+python upscale.py -r <realesrgan> -g <game_path> \
+	--double-upscale-small --double-upscale-min-size 128 --double-upscale-max-size 256 -vv
+```
+
+Separate model/format for second pass:
+```powershell
+python upscale.py -r <realesrgan> -g <game_path> \
+	--realesrgan-args "-n realesrgan-x4plus" \
+	--double-upscale-small --double-upscale-min-size 64 --double-upscale-max-size 192 \
+	--double-upscale-extra-args "-n realesrgan-x4plus -f png"
+```
+
+Notes:
+* Only textures processed in the current run are considered (prevents repeated amplification across runs).
+* Choose an upper bound that still benefits from another upscale; very large textures often gain artifacts.
+* Summary line: `Second-pass double upscaled: <count>` appears with `-v` (and cap value if used).
+* Size cap uses high-quality Lanczos resizing and preserves original format when possible.
+
+Example with size cap (second pass 256–512, clamp anything over 1024):
+```powershell
+python upscale.py -r <realesrgan> -g <game_path> \
+	--double-upscale-small --double-upscale-min-size 256 --double-upscale-max-size 512 \
+	--double-upscale-max-result 1024
+```
 ```
 
 ---
@@ -235,6 +284,7 @@ Visual output (when using `--visual-dir`):
 |------|----------------------|
 | Basic upscale | `python upscale.py -r <realesrgan> -g <game>` |
 | Include ID replacement | `python upscale.py -r <realesrgan> -g <game> --id-replace` |
+| Second pass 128–256 | `python upscale.py -r <realesrgan> -g <game> --double-upscale-small --double-upscale-min-size 128 --double-upscale-max-size 256` |
 | Dry run preview | `python upscale.py -r <realesrgan> -g <game> --id-replace --dry-run` |
 | Similarity audit (defaults) | `python detect_similar_images.py -g <game>` |
 | Similarity audit @256 base | `python detect_similar_images.py -g <game> --base-size 256` |

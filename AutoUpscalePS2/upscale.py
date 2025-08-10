@@ -110,6 +110,37 @@ def parse_args() -> argparse.Namespace:
         "-c", "--clean", action="store_true",
         help="Wipe the intermediate cache folder before processing (forces full re-upscale)."
     )
+    # Second-pass double upscaling for very small textures
+    parser.add_argument(
+        "--double-upscale-small",
+        action="store_true",
+        help=(
+            "After the first upscale pass, run Real-ESRGAN a SECOND time on freshly processed textures whose max dimension lies within the configured size range."
+        ),
+    )
+    parser.add_argument(
+        "--double-upscale-extra-args",
+        default="",
+        help="Extra arguments ONLY for the second Real-ESRGAN pass (falls back to --realesrgan-args if empty).",
+    )
+    parser.add_argument(
+        "--double-upscale-min-size",
+        type=int,
+        default=128,
+        help="Minimum width/height (inclusive) to qualify for second-pass upscaling (default 128).",
+    )
+    parser.add_argument(
+        "--double-upscale-max-size",
+        type=int,
+        default=512,
+        help="Maximum width/height (inclusive) to qualify for second-pass upscaling (default 512). Overrides deprecated --double-upscale-threshold if provided.",
+    )
+    parser.add_argument(
+        "--double-upscale-max-result",
+        type=int,
+        default=1024,
+        help="Cap final max(width,height) AFTER second pass (0 disables, default 1024). If an image exceeds this after the second pass it will be downscaled to fit (aspect preserved)",
+    )
     return parser.parse_args()
 
 def vprint(msg: str, level: int, verbosity: int):
@@ -629,6 +660,18 @@ def main() -> None:
             1,
             verbosity,
         )
+    if args.double_upscale_small:
+        vprint(
+            f"  Double small upscale: range {args.double_upscale_min_size}-{args.double_upscale_max_size} second-pass extra args: '{args.double_upscale_extra_args or '(inherit)'}'",
+            1,
+            verbosity,
+        )
+        if args.double_upscale_max_result > 0:
+            vprint(
+                f"  Second pass result size cap: <= {args.double_upscale_max_result} (will downscale if exceeded)",
+                1,
+                verbosity,
+            )
     if args.dry_run:
         print("  Dry run: enabled (no changes will be made)")
 
@@ -747,6 +790,7 @@ def main() -> None:
     if total_to_process == 0:
         vprint("[Step 1] No new or updated textures to upscale (continuing with existing intermediates)", 1, verbosity)
         t_step1 = perf_counter(); t_step1_end = t_step1
+        double_upscale_count = 0
     else:
         # Run Real-ESRGAN on staged temp input -> intermediates as output
         t_step1 = perf_counter()
@@ -777,6 +821,111 @@ def main() -> None:
                     except OSError as e:
                         vprint(f"[Stage][Warn] Failed to apply original timestamp to {out_path}: {e}", 4, verbosity)
             shutil.rmtree(temp_in_dir, ignore_errors=True)
+        # Optional second pass on small textures
+        double_upscale_count = 0
+        if args.double_upscale_small:
+            vprint("[Step 1b] Preparing second-pass upscale for very small textures", 1, verbosity)
+            try:
+                from PIL import Image  # type: ignore
+            except ImportError:
+                print("[Step 1b][Warn] Pillow not installed; cannot size-check for double upscaling. Skipping second pass.")
+            else:
+                temp_in_dir2 = interm_dir / "_pending_upscale_second"
+                if not args.dry_run and temp_in_dir2.exists():
+                    shutil.rmtree(temp_in_dir2)
+                # Only consider textures processed THIS run (source_times keys) to avoid exponential growth
+                qualifying: List[Path] = []
+                range_min = args.double_upscale_min_size
+                range_max = args.double_upscale_max_size
+                if range_min > range_max:
+                    print(f"[Step 1b][Error] Invalid double upscale size range: min {range_min} > max {range_max}. Skipping second pass.")
+                    range_min, range_max = None, None  # type: ignore
+                for rel_path in source_times.keys():
+                    candidate = interm_dir / rel_path
+                    if not candidate.exists():
+                        continue
+                    if candidate.suffix.lower() not in IMAGE_EXTS:
+                        continue
+                    stem = candidate.stem
+                    if not is_eligible_filename(stem):
+                        continue
+                    try:
+                        with Image.open(candidate) as im:
+                            w, h = im.size
+                    except OSError as e:
+                        vprint(f"[Step 1b][Warn] Cannot open {candidate}: {e}", 3, verbosity)
+                        continue
+                    if range_min is not None and range_min <= max(w, h) <= range_max:
+                        qualifying.append(candidate)
+                vprint(f"  Textures qualifying for second pass: {len(qualifying)} (range {range_min}-{range_max})", 1, verbosity)
+                if qualifying:
+                    if not args.dry_run:
+                        for cand in qualifying:
+                            rel_cand = cand.relative_to(interm_dir)
+                            target_dir = temp_in_dir2 / rel_cand.parent
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            try:
+                                shutil.copy2(cand, temp_in_dir2 / rel_cand)
+                            except OSError as e:
+                                vprint(f"[Step 1b][Warn] Failed staging for second pass {cand}: {e}", 2, verbosity)
+                                continue
+                    # Run second pass
+                    second_args = args.double_upscale_extra_args or args.realesrgan_args
+                    if second_args and verbosity >= 2:
+                        vprint(f"[Step 1b] Second pass extra args: {second_args}", 2, verbosity)
+                    rc2 = 0 if args.dry_run else run_realesrgan_on_dir(
+                        cmd,
+                        temp_in_dir2,
+                        interm_dir,
+                        second_args,
+                        dry_run=args.dry_run,
+                        verbosity=verbosity,
+                    )
+                    if rc2 != 0:
+                        print("[Warning] Second Real-ESRGAN pass failed; results for small textures may be incomplete.")
+                    else:
+                        double_upscale_count = len(qualifying)
+                        # Optional clamp of oversized second-pass outputs
+                        clamped = 0
+                        max_result = args.double_upscale_max_result
+                        if max_result > 0:
+                            vprint(f"[Step 1b] Applying post-second-pass size cap <= {max_result}", 2, verbosity)
+                            for cand in qualifying:
+                                if not cand.exists():
+                                    continue
+                                try:
+                                    with Image.open(cand) as im:
+                                        w2, h2 = im.size
+                                        m2 = max(w2, h2)
+                                        if m2 > max_result:
+                                            scale = max_result / float(m2)
+                                            new_size = (max(1, int(round(w2 * scale))), max(1, int(round(h2 * scale))))
+                                            if not args.dry_run:
+                                                im_resized = im.resize(new_size, Image.Resampling.LANCZOS)
+                                                # Preserve format if possible
+                                                try:
+                                                    im_resized.save(cand, format=im.format)
+                                                except ValueError:
+                                                    im_resized.save(cand)
+                                            clamped += 1
+                                except OSError as e:
+                                    vprint(f"[Step 1b][Clamp][Warn] Failed to open for clamp {cand}: {e}", 3, verbosity)
+                            if clamped:
+                                vprint(f"[Step 1b] Clamped {clamped} second-pass outputs to <= {max_result}", 1, verbosity)
+                        # Re-apply original timestamps again (so incremental re-run logic unaffected)
+                        if not args.dry_run:
+                            # Re-apply original timestamps again (so incremental re-run logic unaffected)
+                            for rel_path, (at_ns, mt_ns) in source_times.items():
+                                out_path = interm_dir / rel_path
+                                if out_path.exists():
+                                    try:
+                                        os.utime(out_path, ns=(at_ns, mt_ns))
+                                    except OSError as e:
+                                        vprint(f"[Step 1b][Warn] Failed to re-apply timestamp to {out_path}: {e}", 4, verbosity)
+                    if not args.dry_run and temp_in_dir2.exists():
+                        shutil.rmtree(temp_in_dir2, ignore_errors=True)
+                else:
+                    vprint("[Step 1b] No small textures required second pass", 2, verbosity)
         t_step1_end = perf_counter()
 
     vprint("[Step 2] ID-based small texture replacement & mip patching", 1, verbosity)
@@ -825,6 +974,10 @@ def main() -> None:
             else:
                 print(f"  Mips patched: {mips_patched} - processed in {step2_time:.2f}s")
             print(f"  Files copied: {files_copied} - completed in {step3_time:.2f}s")
+            if total_to_process > 0 and args.double_upscale_small:
+                print(f"  Second-pass double upscaled: {double_upscale_count}")
+                if args.double_upscale_max_result > 0:
+                    print(f"  Second-pass size cap: <= {args.double_upscale_max_result}")
             print(f"  Total elapsed: {total_elapsed:.2f}s")
             if errors:
                 print(f"  Errors: {len(errors)} (see above messages)")
