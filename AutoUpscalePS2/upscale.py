@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -224,6 +225,27 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
     """
     vprint(f"[Mips] Patching mip levels under: {root}", 2, verbosity)
 
+    # Manifest path (stored in the same root). Hidden-ish name to avoid collisions.
+    manifest_path = root / ".mipcache.json"
+    manifest: Dict[str, Dict[str, object]] = {}
+    if manifest_path.exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("groups"), dict):
+                manifest = data["groups"]  # type: ignore
+            else:
+                vprint(f"[Mips][Cache] Manifest invalid schema, ignoring: {manifest_path}", 3, verbosity)
+        except (OSError, json.JSONDecodeError) as e:
+            vprint(f"[Mips][Cache] Failed to read manifest (ignored): {e}", 3, verbosity)
+
+    # Helper to build a stable group id for manifest keys.
+    def group_id(dir_path: Path, key: str, ext: str) -> str:
+        rel = os.path.relpath(dir_path, root)
+        if rel == '.':
+            rel = ''
+        return f"{rel}|{key}|{ext}"
+
     # Map[(dirpath, key, ext)] -> {mip_num: Path}
     groups: Dict[Tuple[Path, str, str], Dict[int, Path]] = {}
     # Map to the base (no -mip) image for each group, if present
@@ -256,6 +278,8 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
 
     total_overwrites = 0
     anomalous_groups = 0
+    skipped_groups_cache = 0
+    updated_manifest: Dict[str, Dict[str, object]] = {}
     for (d, key, ext), mip_map in groups.items():
         if not mip_map:
             continue
@@ -264,31 +288,82 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
             # Fallback to the smallest mip index (legacy behavior) if no base is present
             highest_mip = min(mip_map.keys())  # usually 0
             src_path = mip_map[highest_mip]
+        try:
+            src_stat = src_path.stat()
+            base_mtime_ns = getattr(src_stat, 'st_mtime_ns', int(src_stat.st_mtime*1e9))
+            base_size = src_stat.st_size
+        except OSError as e:
+            vprint(f"[Mips][Warn] Cannot stat base {src_path}: {e}", 3, verbosity)
+            base_mtime_ns = -1
+            base_size = -1
         # Check for gaps in mip indices (e.g., have 0,2 but missing 1)
         mip_indices = sorted(mip_map.keys())
         expected = list(range(mip_indices[0], mip_indices[-1] + 1))
         if mip_indices != expected:
             anomalous_groups += 1
             vprint(f"[Mips][Warn] Non-contiguous mip chain in {d}: {mip_indices}", 3, verbosity)
+        gid = group_id(d, key, ext)
+        # Build relative paths list (excluding base if it itself is a -mip file included in map)
+        rel_mip_paths: List[str] = []
+        for _, dst_path in sorted(mip_map.items()):
+            if dst_path == src_path:
+                continue
+            rel_mip_paths.append(os.path.relpath(dst_path, root))
+
+        # Cache skip logic: Only skip if manifest entry matches base metadata and all mip files exist with identical mtime.
+        cache_entry = manifest.get(gid)
+        can_skip = False
+        if cache_entry and not dry_run:
+            try:
+                c_base = cache_entry.get("base")
+                c_mtime = cache_entry.get("base_mtime_ns")
+                c_size = cache_entry.get("base_size")
+                c_mips = cache_entry.get("mips")
+                if (
+                    isinstance(c_base, str) and isinstance(c_mtime, int) and isinstance(c_size, int) and isinstance(c_mips, list)
+                    and base_mtime_ns == c_mtime and base_size == c_size
+                ):
+                    # Verify mips set equality
+                    mips_set_current = set(rel_mip_paths)
+                    mips_set_cached = set(str(x) for x in c_mips)
+                    if mips_set_current == mips_set_cached:
+                        # Ensure each mip timestamp matches base timestamp (meaning already patched)
+                        all_match = True
+                        for rel_path in rel_mip_paths:
+                            p = root / rel_path
+                            try:
+                                st = p.stat()
+                                if getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9)) != base_mtime_ns:
+                                    all_match = False
+                                    break
+                            except OSError:
+                                all_match = False
+                                break
+                        if all_match:
+                            can_skip = True
+            except Exception:
+                can_skip = False
+        if can_skip:
+            skipped_groups_cache += 1
+            # Retain manifest entry unchanged
+            updated_manifest[gid] = cache_entry  # type: ignore
+            continue
+
+        # Perform patching for this group.
         for mip, dst_path in mip_map.items():
             if src_path == dst_path:
                 continue
             vprint(f"[Mips] Overwrite {dst_path.name} with {src_path.name}", 2, verbosity)
             total_overwrites += 1
             if not dry_run:
-                # Preserve existing destination timestamps to avoid triggering downstream sync each run
+                # Set destination timestamps to the base timestamp to mark group as already patched.
                 try:
-                    try:
-                        dst_stat = dst_path.stat()
-                        preserve_times = (getattr(dst_stat, 'st_atime_ns', int(dst_stat.st_atime*1e9)), getattr(dst_stat, 'st_mtime_ns', int(dst_stat.st_mtime*1e9)))
-                    except FileNotFoundError:
-                        preserve_times = None
                     shutil.copyfile(src_path, dst_path)
-                    if preserve_times is not None:
+                    if base_mtime_ns > 0:
                         try:
-                            os.utime(dst_path, ns=preserve_times)
+                            os.utime(dst_path, ns=(base_mtime_ns, base_mtime_ns))
                         except OSError as e2:
-                            vprint(f"[Mips][Warn] Failed to restore timestamp on {dst_path}: {e2}", 4, verbosity)
+                            vprint(f"[Mips][Warn] Failed to apply base timestamp to {dst_path}: {e2}", 4, verbosity)
                 except PermissionError:
                     msg = f"[Error] Permission denied while overwriting mip file: {dst_path} (is it read-only?)"
                     print(msg)
@@ -299,10 +374,27 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
                     print(msg)
                     if errors is not None:
                         errors.append(msg)
+        # Update manifest entry for this group (even if dry run we simulate in-memory only)
+        updated_manifest[gid] = {
+            "base": os.path.relpath(src_path, root),
+            "base_mtime_ns": base_mtime_ns,
+            "base_size": base_size,
+            "mips": rel_mip_paths,
+        }
     if dry_run:
-        vprint(f"  Would have patched {total_overwrites} files (dry run).", 1, verbosity)
+        vprint(f"  Would have patched {total_overwrites} files (dry run). Cache-skipped groups: {skipped_groups_cache}", 1, verbosity)
     else:
-        vprint(f"  Patched {total_overwrites} files (anomalous groups: {anomalous_groups}).", 1, verbosity)
+        vprint(f"  Patched {total_overwrites} files (anomalous groups: {anomalous_groups}) cache-skipped groups: {skipped_groups_cache}.", 1, verbosity)
+        # Write manifest (replace with only the groups we processed / retained)
+        try:
+            manifest_obj = {"version": 1, "groups": updated_manifest}
+            with manifest_path.open("w", encoding="utf-8") as f:
+                json.dump(manifest_obj, f, indent=2)
+        except OSError as e:
+            msg = f"[Mips][Cache][Error] Failed writing manifest: {e}"
+            print(msg)
+            if errors is not None:
+                errors.append(msg)
     return total_overwrites
 
 
