@@ -435,7 +435,7 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, e
         if not dry_run:
             out_dir.mkdir(parents=True, exist_ok=True)
         for fn in filenames:
-            if fn == ".mipcache.json":  # internal cache, not part of output
+            if fn in {".mipcache.json", ".idhashcache.json"}:  # internal caches, not part of output
                 vprint(f"[Copy][SkipCache] {fn}", 4, verbosity)
                 continue
             src_file = Path(dirpath) / fn
@@ -478,7 +478,7 @@ def copy_changed(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0
         if not dry_run:
             out_dir.mkdir(parents=True, exist_ok=True)
         for fn in filenames:
-            if fn == ".mipcache.json":  # internal cache, not part of output
+            if fn in {".mipcache.json", ".idhashcache.json"}:  # internal caches, not part of output
                 vprint(f"[CopyΔ][SkipCache] {fn}", 4, verbosity)
                 continue
             sfile = Path(dirpath) / fn
@@ -566,25 +566,75 @@ def replace_small_id_variants(
         print(f"[IDReplace][Error] Invalid hash threshold: {SIM_HASH_THRESHOLD}")
         return 0
 
+    # Persistent hash cache (stores per-file hash keyed by relative path) to avoid re-hashing unchanged images
+    hash_manifest_path = root / ".idhashcache.json"
+    hash_manifest: Dict[str, Dict[str, object]] = {}
+    if hash_manifest_path.exists():
+        try:
+            with hash_manifest_path.open("r", encoding="utf-8") as f:
+                hdata = json.load(f)
+            if isinstance(hdata, dict) and hdata.get("version") == 1 and isinstance(hdata.get("entries"), dict):
+                hash_manifest = hdata["entries"]  # type: ignore
+            else:
+                vprint(f"[IDReplace][Cache] Invalid hash manifest schema (ignored): {hash_manifest_path}", 4, verbosity)
+        except (OSError, json.JSONDecodeError) as e:
+            vprint(f"[IDReplace][Cache] Failed to read hash manifest (ignored): {e}", 3, verbosity)
+
+    updated_hash_manifest: Dict[str, Dict[str, object]] = {}
+
     def compute_ahash(path: Path) -> Optional[int]:
-        """Compute an average hash (aHash) for similarity gating. Returns 64-bit int or None on failure."""
+        """Compute or retrieve cached average hash (aHash)."""
+        rel = os.path.relpath(path, root)
+        try:
+            st = path.stat()
+            mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9))
+            fsize = st.st_size
+        except OSError as e:
+            msg = f"[IDReplace][Warn] Cannot stat {path}: {e}"
+            vprint(msg, 3, verbosity)
+            if errors is not None:
+                errors.append(msg)
+            return None
+        entry = hash_manifest.get(rel)
+        if (
+            entry and isinstance(entry, dict)
+            and entry.get("hash_size") == SIM_HASH_SIZE
+            and entry.get("mtime_ns") == mtime_ns
+            and entry.get("size") == fsize
+            and isinstance(entry.get("hash"), str)
+        ):
+            try:
+                hval = int(entry["hash"], 16)
+                updated_hash_manifest[rel] = entry  # carry forward
+                vprint(f"[IDReplace][CacheHit] {rel}", 5, verbosity)
+                return hval
+            except ValueError:
+                pass  # fall through to recompute
+        # Compute hash fresh
         try:
             with Image.open(path) as im:
                 im = im.convert("L")
                 im_small = im.resize((SIM_HASH_SIZE, SIM_HASH_SIZE), Image.Resampling.LANCZOS)
                 pixels = list(im_small.getdata())
-                mean_val = sum(pixels) / len(pixels)
-                bits = 0
-                for i, px in enumerate(pixels):
-                    if px >= mean_val:
-                        bits |= 1 << i
-                return bits
         except OSError as e:
-            msg = f"[IDReplace][Warn] Cannot hash {path}: {e}"
+            msg = f"[IDReplace][Warn] Cannot open {path} for hashing: {e}"
             vprint(msg, 3, verbosity)
             if errors is not None:
                 errors.append(msg)
             return None
+        mean_val = sum(pixels) / len(pixels)
+        bits = 0
+        for i, px in enumerate(pixels):
+            if px >= mean_val:
+                bits |= 1 << i
+        updated_hash_manifest[rel] = {
+            "mtime_ns": mtime_ns,
+            "size": fsize,
+            "hash": format(bits, 'x'),
+            "hash_size": SIM_HASH_SIZE,
+        }
+        vprint(f"[IDReplace][CacheMiss] {rel}", 5, verbosity)
+        return bits
 
     def hamming(a: int, b: int) -> int:
         return (a ^ b).bit_count()
@@ -702,6 +752,15 @@ def replace_small_id_variants(
         vprint(f"[IDReplace] Would have replaced {replacements} small textures (dry run). Similarity skips: {similarity_skips}", 1, verbosity)
     else:
         vprint(f"[IDReplace] Replaced {replacements} small textures. Similarity skips: {similarity_skips}", 1, verbosity)
+        # Persist hash cache (merge updated entries; drop stale ones automatically by only writing updated set)
+        try:
+            with hash_manifest_path.open("w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": updated_hash_manifest}, f, indent=2)
+        except OSError as e:
+            msg = f"[IDReplace][Cache][Error] Failed writing hash manifest: {e}"
+            print(msg)
+            if errors is not None:
+                errors.append(msg)
     return replacements
 
 
