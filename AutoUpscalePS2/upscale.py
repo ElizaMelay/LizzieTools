@@ -232,7 +232,8 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
         try:
             with manifest_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("groups"), dict):
+            # Support legacy version 1 (no per-mip mtimes) and new version 2
+            if isinstance(data, dict) and data.get("version") in (1, 2) and isinstance(data.get("groups"), dict):
                 manifest = data["groups"]  # type: ignore
             else:
                 vprint(f"[Mips][Cache] Manifest invalid schema, ignoring: {manifest_path}", 3, verbosity)
@@ -319,28 +320,41 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
                 c_mtime = cache_entry.get("base_mtime_ns")
                 c_size = cache_entry.get("base_size")
                 c_mips = cache_entry.get("mips")
+                # Version 1: c_mips is list of strings; Version 2: list of objects {path, mtime_ns}
                 if (
-                    isinstance(c_base, str) and isinstance(c_mtime, int) and isinstance(c_size, int) and isinstance(c_mips, list)
+                    isinstance(c_base, str) and isinstance(c_mtime, int) and isinstance(c_size, int) and c_mips is not None
                     and base_mtime_ns == c_mtime and base_size == c_size
                 ):
-                    # Verify mips set equality
-                    mips_set_current = set(rel_mip_paths)
-                    mips_set_cached = set(str(x) for x in c_mips)
-                    if mips_set_current == mips_set_cached:
-                        # Ensure each mip timestamp matches base timestamp (meaning already patched)
-                        all_match = True
-                        for rel_path in rel_mip_paths:
-                            p = root / rel_path
-                            try:
-                                st = p.stat()
-                                if getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9)) != base_mtime_ns:
-                                    all_match = False
-                                    break
-                            except OSError:
-                                all_match = False
-                                break
-                        if all_match:
-                            can_skip = True
+                    # Normalize cached mip list
+                    current_set = set(rel_mip_paths)
+                    if isinstance(c_mips, list):
+                        if c_mips and isinstance(c_mips[0], dict):  # version 2 format
+                            cached_paths = {str(entry.get("path")) for entry in c_mips if isinstance(entry, dict) and entry.get("path")}
+                            if cached_paths == current_set:
+                                all_match = True
+                                # Per-mip timestamp verification
+                                for entry in c_mips:  # type: ignore
+                                    if not isinstance(entry, dict):
+                                        all_match = False; break
+                                    p_rel = entry.get("path")
+                                    p_mtime = entry.get("mtime_ns")
+                                    if not isinstance(p_rel, str) or not isinstance(p_mtime, int):
+                                        all_match = False; break
+                                    p = root / p_rel
+                                    try:
+                                        st = p.stat()
+                                        if getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9)) != p_mtime:
+                                            all_match = False; break
+                                    except OSError:
+                                        all_match = False; break
+                                if all_match:
+                                    can_skip = True
+                        else:  # version 1 fallback (no per-mip timestamp check)
+                            cached_paths = {str(x) for x in c_mips}
+                            if cached_paths == current_set:
+                                # Need to confirm each mip file mtime == its current value in filesystem (no base tie)
+                                # Since we cannot compare old values, we conservatively patch once to upgrade manifest.
+                                can_skip = False
             except Exception:
                 can_skip = False
         if can_skip:
@@ -356,14 +370,19 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
             vprint(f"[Mips] Overwrite {dst_path.name} with {src_path.name}", 2, verbosity)
             total_overwrites += 1
             if not dry_run:
-                # Set destination timestamps to the base timestamp to mark group as already patched.
+                # Preserve original destination timestamps (so Stage does not view them as outdated).
                 try:
+                    try:
+                        dst_stat = dst_path.stat()
+                        preserve_times = (getattr(dst_stat, 'st_atime_ns', int(dst_stat.st_atime*1e9)), getattr(dst_stat, 'st_mtime_ns', int(dst_stat.st_mtime*1e9)))
+                    except FileNotFoundError:
+                        preserve_times = None
                     shutil.copyfile(src_path, dst_path)
-                    if base_mtime_ns > 0:
+                    if preserve_times is not None:
                         try:
-                            os.utime(dst_path, ns=(base_mtime_ns, base_mtime_ns))
+                            os.utime(dst_path, ns=preserve_times)
                         except OSError as e2:
-                            vprint(f"[Mips][Warn] Failed to apply base timestamp to {dst_path}: {e2}", 4, verbosity)
+                            vprint(f"[Mips][Warn] Failed to restore timestamp on {dst_path}: {e2}", 4, verbosity)
                 except PermissionError:
                     msg = f"[Error] Permission denied while overwriting mip file: {dst_path} (is it read-only?)"
                     print(msg)
@@ -374,12 +393,21 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
                     print(msg)
                     if errors is not None:
                         errors.append(msg)
-        # Update manifest entry for this group (even if dry run we simulate in-memory only)
+        # Update manifest entry for this group (even if dry run we simulate in-memory only). Version 2 stores per-mip mtimes.
+        mip_entries: List[Dict[str, object]] = []
+        for rel_path in rel_mip_paths:
+            p = root / rel_path
+            try:
+                st = p.stat()
+                mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9))
+            except OSError:
+                mtime_ns = -1
+            mip_entries.append({"path": rel_path, "mtime_ns": mtime_ns})
         updated_manifest[gid] = {
             "base": os.path.relpath(src_path, root),
             "base_mtime_ns": base_mtime_ns,
             "base_size": base_size,
-            "mips": rel_mip_paths,
+            "mips": mip_entries,
         }
     if dry_run:
         vprint(f"  Would have patched {total_overwrites} files (dry run). Cache-skipped groups: {skipped_groups_cache}", 1, verbosity)
@@ -387,7 +415,7 @@ def patch_mips_in_place(root: Path, dry_run: bool = False, verbosity: int = 0, e
         vprint(f"  Patched {total_overwrites} files (anomalous groups: {anomalous_groups}) cache-skipped groups: {skipped_groups_cache}.", 1, verbosity)
         # Write manifest (replace with only the groups we processed / retained)
         try:
-            manifest_obj = {"version": 1, "groups": updated_manifest}
+            manifest_obj = {"version": 2, "groups": updated_manifest}
             with manifest_path.open("w", encoding="utf-8") as f:
                 json.dump(manifest_obj, f, indent=2)
         except OSError as e:
@@ -407,6 +435,9 @@ def copy_tree(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0, e
         if not dry_run:
             out_dir.mkdir(parents=True, exist_ok=True)
         for fn in filenames:
+            if fn == ".mipcache.json":  # internal cache, not part of output
+                vprint(f"[Copy][SkipCache] {fn}", 4, verbosity)
+                continue
             src_file = Path(dirpath) / fn
             dst_file = out_dir / fn
             vprint(f"[Copy] {src_file} -> {dst_file}", 3, verbosity)
@@ -447,6 +478,9 @@ def copy_changed(src: Path, dst: Path, dry_run: bool = False, verbosity: int = 0
         if not dry_run:
             out_dir.mkdir(parents=True, exist_ok=True)
         for fn in filenames:
+            if fn == ".mipcache.json":  # internal cache, not part of output
+                vprint(f"[CopyΔ][SkipCache] {fn}", 4, verbosity)
+                continue
             sfile = Path(dirpath) / fn
             dfile = out_dir / fn
             try:
