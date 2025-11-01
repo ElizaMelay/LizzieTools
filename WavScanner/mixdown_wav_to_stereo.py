@@ -258,6 +258,114 @@ def describe_downmix_from_roles(roles: List[str]) -> Tuple[str, str]:
             right_parts.append(f"{FRIENDLY_ROLE.get(r, r)} ({r}, {dbR:+.1f} dB)")
     return ", ".join(left_parts) or "(none)", ", ".join(right_parts) or "(none)"
 
+
+def make_roles_transform(roles: Optional[List[str]]) -> Optional[Any]:
+    """Build a transform based on a roles list (e.g., ['FL','FR','FC','LFE']). Returns None if roles is invalid."""
+    if not roles:
+        return None
+    ch = len(roles)
+    # Reuse same weight mapping logic as mask-based transform
+    def role_weights(role: str) -> Tuple[float, float]:
+        if role == 'FL':
+            return 1.0, 0.0
+        if role == 'FR':
+            return 0.0, 1.0
+        if role in ('FC', 'TFC', 'TC'):
+            return SQRT1_2, SQRT1_2
+        if role == 'LFE':
+            return 0.5, 0.5
+        if role in ('BL', 'SL', 'TBL', 'TSL', 'BLC'):
+            return SQRT1_2, 0.0
+        if role in ('BR', 'SR', 'TBR', 'TSR', 'BRC'):
+            return 0.0, SQRT1_2
+        if role == 'BC':
+            return 0.5, 0.5
+        if role == 'FLC':
+            return 0.5, 0.0
+        if role == 'FRC':
+            return 0.0, 0.5
+        return 0.5, 0.5
+
+    lw = np.array([role_weights(r)[0] for r in roles], dtype=np.float32)
+    rw = np.array([role_weights(r)[1] for r in roles], dtype=np.float32)
+
+    def transform(block: np.ndarray) -> np.ndarray:
+        if block.ndim != 2 or block.shape[1] != ch:
+            raise ValueError('Unexpected block shape for roles-based transform')
+        b = block.astype(np.float32, copy=False)
+        L = np.sum(b * lw[None, :], axis=1)
+        R = np.sum(b * rw[None, :], axis=1)
+        return np.stack([L, R], axis=1)
+
+    return transform
+
+
+def heuristic_roles_for_channels(ch: int) -> Optional[List[str]]:
+    """Return a guessed roles list for common layouts, else None."""
+    if ch == 1:
+        return ['FC']
+    if ch == 2:
+        return ['FL', 'FR']
+    if ch == 3:
+        return ['FL', 'FR', 'FC']
+    if ch == 4:
+        # Assume L, R, Ls, Rs
+        return ['FL', 'FR', 'SL', 'SR']
+    if ch == 5:
+        return ['FL', 'FR', 'FC', 'SL', 'SR']
+    if ch == 6:
+        return ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR']
+    if ch == 7:
+        return ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR', 'BC']
+    if ch >= 8:
+        return ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR', 'BL', 'BR']
+    return None
+
+
+def _ffprobe_layout(path: Path) -> Optional[str]:
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channel_layout', '-of', 'default=noprint_wrappers=1:nokey=1', str(path)]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if r.returncode != 0:
+            return None
+        layout = r.stdout.decode('utf-8', errors='ignore').strip()
+        return layout or None
+    except Exception:
+        return None
+
+
+def roles_from_ffprobe_layout(layout: Optional[str], ch: int) -> Optional[List[str]]:
+    if not layout:
+        return None
+    l = layout.lower()
+    # Common layouts
+    if l in ('mono',):
+        return ['FC'] if ch == 1 else None
+    if l in ('stereo',):
+        return ['FL', 'FR'] if ch == 2 else None
+    if l in ('2.1', 'stereo+lfe') and ch == 3:
+        return ['FL', 'FR', 'LFE']
+    if l in ('3.0',) and ch == 3:
+        return ['FL', 'FR', 'FC']
+    if l in ('3f/lfe', '3.1') and ch == 4:
+        return ['FL', 'FR', 'FC', 'LFE']
+    if l in ('quad',) and ch == 4:
+        return ['FL', 'FR', 'BL', 'BR']
+    if l in ('4.0',) and ch == 4:
+        return ['FL', 'FR', 'FC', 'BC']
+    if l in ('5.0',) and ch == 5:
+        return ['FL', 'FR', 'FC', 'SL', 'SR']
+    if l in ('5.1',) and ch == 6:
+        return ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR']
+    if l in ('7.1', '7.1(rear)') and ch == 8:
+        return ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR', 'BL', 'BR']
+    if l in ('7.1(wide)',) and ch == 8:
+        return ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR']
+    return None
+
 def downmix_block(block: np.ndarray) -> np.ndarray:
     """
     Downmix a block of shape (frames, channels) -> (frames, 2) as float32.
@@ -517,8 +625,13 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             # Choose transform
             # Prefer mask-based transform if available
             mask = parse_wav_channel_mask(backup_path)
-            transform = (lambda x: x) if sfi.channels == 2 else (make_mask_transform(mask, sfi.channels) or downmix_block)
-            transform_name = 'passthrough' if sfi.channels == 2 else ('mask' if make_mask_transform(mask, sfi.channels) else 'heuristic')
+            roles = roles_from_mask(mask, sfi.channels)
+            if not roles:
+                layout = _ffprobe_layout(backup_path)
+                roles = roles_from_ffprobe_layout(layout, sfi.channels)
+            tm = make_roles_transform(roles)
+            transform = (lambda x: x) if sfi.channels == 2 else (tm or downmix_block)
+            transform_name = 'passthrough' if sfi.channels == 2 else ('mask' if roles_from_mask(mask, sfi.channels) else ('ffprobe' if tm is not None else 'heuristic'))
             # Normalize using global peak if requested
             if normalize:
                 peak = _compute_peak(backup_path, chunk_size=chunk_size, transform=transform)
@@ -559,6 +672,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                 "subtype": sfi.subtype,
                 "bits": bits_in,
                 "mask": f"0x{mask:08X}" if mask is not None else None,
+                "roles": roles,
             },
             "dest": {
                 "subtype": out_subtype,
@@ -590,9 +704,13 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
     with sf.SoundFile(str(in_path), mode='r') as sfi:
         out_subtype = subtype or sfi.subtype or 'PCM_16'
         mask = parse_wav_channel_mask(in_path)
-        tm = make_mask_transform(mask, ch)
+        roles = roles_from_mask(mask, ch)
+        if not roles:
+            layout = _ffprobe_layout(in_path)
+            roles = roles_from_ffprobe_layout(layout, ch)
+        tm = make_roles_transform(roles)
         transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
-        transform_name = 'passthrough' if ch == 2 else ('mask' if tm is not None else 'heuristic')
+        transform_name = 'passthrough' if ch == 2 else ('mask' if roles_from_mask(mask, ch) else ('ffprobe' if tm is not None else 'heuristic'))
         if normalize:
             peak = _compute_peak(in_path, chunk_size=chunk_size, transform=transform)
             scale = (1.0 / peak) if peak > 1.0 else 1.0
@@ -621,6 +739,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                 "subtype": sfi.subtype,
                 "bits": bits_in,
                 "mask": f"0x{mask:08X}" if mask is not None else None,
+                "roles": roles,
             },
             "dest": {
                 "subtype": out_subtype,
@@ -733,24 +852,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             src = d.get('source', {})
             dst = d.get('dest', {})
             print(f"  Original: {src.get('channels')} channels @ {src.get('samplerate')} Hz, {src.get('subtype')} ({src.get('bits')}‑bit)")
-            mask_str = friendly_mask_list(mask=None, ch=0)  # placeholder; we'll compute below
-            # Recompute friendly mask for printing, using available info
-            src_mask = src.get('mask')
-            if isinstance(src_mask, str) and src_mask.startswith('0x'):
-                try:
-                    src_mask_int = int(src_mask, 16)
-                except Exception:
-                    src_mask_int = None
-            else:
-                src_mask_int = None
-            roles = roles_from_mask(src_mask_int, src.get('channels') or 0) if src_mask_int is not None else None
+            # Friendly layout and downmix plan
+            roles = src.get('roles')
+            shown_layout = False
             if roles:
-                print(f"  Channel layout (from file): {friendly_mask_list(src_mask_int, src.get('channels'))}")
+                # If roles came from mask or ffprobe, present them as layout
+                print("  Channel layout:", ", ".join(f"{FRIENDLY_ROLE.get(r, r)} ({r})" for r in roles))
+                shown_layout = True
+            else:
+                # Try mask-based layout string
+                src_mask = src.get('mask')
+                src_mask_int = int(src_mask, 16) if isinstance(src_mask, str) and src_mask.startswith('0x') else None
+                if src_mask_int is not None:
+                    friendly = friendly_mask_list(src_mask_int, src.get('channels') or 0)
+                    if friendly:
+                        print(f"  Channel layout: {friendly}")
+                        roles = roles_from_mask(src_mask_int, src.get('channels') or 0)
+                        shown_layout = True
+            # If still no roles, use heuristic and tell the user
+            if not roles:
+                roles = heuristic_roles_for_channels(src.get('channels') or 0)
+                if roles:
+                    print("  Guessed channel layout (common pattern):", ", ".join(f"{FRIENDLY_ROLE.get(r, r)} ({r})" for r in roles))
+                else:
+                    print("  Channel layout: not signaled; using generic averaging")
+            # Always show a downmix plan
+            if roles:
                 left_desc, right_desc = describe_downmix_from_roles(roles)
                 print(f"  Downmix plan → Left:  {left_desc}")
                 print(f"                 Right: {right_desc}")
-            else:
-                print(f"  Channel layout: not signaled (using common-layout heuristics)")
             norm_txt = f"on (scale {dst.get('scale'):.3f})" if dst.get('normalize') else "off"
             print(f"  Output: stereo, {dst.get('subtype')} ({dst.get('bits')}‑bit), transform: {dst.get('transform')}, normalization: {norm_txt}")
             if args.verbose >= 2 and d.get('metadata'):
