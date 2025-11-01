@@ -206,6 +206,14 @@ FRIENDLY_ROLE = {
     'BRC': 'Bottom Right of Center',
 }
 
+# Friendly names for Ambisonics (first-order B-Format)
+FRIENDLY_AMBI_ROLE = {
+    'W': 'Omni (W)',
+    'X': 'Front-Back (X)',
+    'Y': 'Left-Right (Y)',
+    'Z': 'Up-Down (Z)',
+}
+
 
 def roles_from_mask(mask: Optional[int], ch: int) -> Optional[List[str]]:
     if mask is None:
@@ -365,6 +373,152 @@ def roles_from_ffprobe_layout(layout: Optional[str], ch: int) -> Optional[List[s
     if l in ('7.1(wide)',) and ch == 8:
         return ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR']
     return None
+
+
+def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optional[str], Optional[Dict[str, Any]]]:
+    """Detect first-order Ambisonics.
+    Returns (roles, kind, info) where:
+      - roles: channel roles if already B-format, else None
+      - kind: 'FuMa' or 'AmbiX' for B-format, else None
+      - info: {'format': 'A'|'B', 'evidence': [...], ...}
+    """
+    if ch < 4:
+        return None, None, None
+    tags = _ffprobe_tags(path) or {}
+    name = path.name.lower()
+    tag_values = [str(v).lower() for v in tags.values() if isinstance(v, (str, int, float))]
+    hay = ' '.join([name] + tag_values)
+    indicators: List[str] = []
+    aformat: List[str] = []
+    # filename indicators
+    if 'ambisonic' in name:
+        indicators.append("filename contains 'ambisonic'")
+    if 'b-format' in name or 'bformat' in name:
+        indicators.append("filename mentions 'B-Format'")
+    if 'ambix' in name:
+        indicators.append("filename contains 'ambix'")
+    if 'fuma' in name:
+        indicators.append("filename contains 'fuma'")
+    if 'a format' in name or 'a-format' in name or 'aformat' in name:
+        aformat.append("filename mentions 'A-Format'")
+    # tag indicators
+    for k, v in (tags or {}).items():
+        try:
+            vv = str(v).lower()
+        except Exception:
+            vv = ''
+        if any(t in vv for t in ['ambisonic', 'b-format', 'bformat', 'ambix', 'fuma']):
+            indicators.append(f"tag {k} contains '{vv}'")
+        if any(t in vv for t in ['a format', 'a-format', 'aformat']):
+            aformat.append(f"tag {k} contains '{vv}'")
+    is_ambi = bool(indicators or aformat)
+    if not is_ambi:
+        return None, None, None
+    # If A-format is indicated, don't assume B-format roles
+    if aformat:
+        info = {
+            'evidence': indicators + aformat,
+            'tags_used': sorted(list(tags.keys())) if isinstance(tags, dict) else None,
+            'format': 'A',
+            'kind': None,
+        }
+        return None, None, info
+    # Else assume B-format; Decide FuMa vs AmbiX (ACN/SN3D) by keywords
+    kind = 'FuMa'
+    if 'ambix' in hay:
+        kind = 'AmbiX'
+    roles = ['W', 'Y', 'Z', 'X'] if kind == 'AmbiX' else ['W', 'X', 'Y', 'Z']
+    info = {
+        'evidence': indicators,
+        'tags_used': sorted(list(tags.keys())) if isinstance(tags, dict) else None,
+        'format': 'B',
+        'kind': kind,
+    }
+    return roles, kind, info
+
+
+def make_ambisonics_transform(roles: List[str], kind: str):
+    """Simple first-order ambisonics stereo decode (horizontal Blumlein-like).
+    Uses L = W + 0.7071*X + 0.7071*Y, R = W + 0.7071*X - 0.7071*Y.
+    Z is ignored for horizontal stereo.
+    """
+    idx = {r: i for i, r in enumerate(roles)}
+    if 'W' not in idx or 'X' not in idx or 'Y' not in idx:
+        return None
+    def transform(block: np.ndarray) -> np.ndarray:
+        b = block.astype(np.float32, copy=False)
+        W = b[:, idx['W']]
+        X = b[:, idx['X']]
+        Y = b[:, idx['Y']]
+        L = W + SQRT1_2 * X + SQRT1_2 * Y
+        R = W + SQRT1_2 * X - SQRT1_2 * Y
+        return np.stack([L, R], axis=1)
+    return transform
+
+
+def describe_downmix_from_ambisonics(roles: List[str]) -> Tuple[str, str]:
+    # L = W + -3 dB X + -3 dB Y; R = W + -3 dB X + -3 dB (-Y)
+    left = []
+    right = []
+    if 'W' in roles:
+        left.append(f"{FRIENDLY_AMBI_ROLE['W']} (+0.0 dB)")
+        right.append(f"{FRIENDLY_AMBI_ROLE['W']} (+0.0 dB)")
+    if 'X' in roles:
+        left.append(f"{FRIENDLY_AMBI_ROLE['X']} (-3.0 dB)")
+        right.append(f"{FRIENDLY_AMBI_ROLE['X']} (-3.0 dB)")
+    if 'Y' in roles:
+        left.append(f"{FRIENDLY_AMBI_ROLE['Y']} (-3.0 dB)")
+        right.append(f"{FRIENDLY_AMBI_ROLE['Y']} (-3.0 dB, inverted to right)")
+    return ', '.join(left), ', '.join(right)
+
+
+def _load_matrix_from_json(path: Path) -> Optional[np.ndarray]:
+    """Load a 4x4 matrix from a JSON file (list of 4 lists of 4 numbers)."""
+    try:
+        with path.open('r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list) and len(data) == 4 and all(isinstance(row, list) and len(row) == 4 for row in data):
+            m = np.array(data, dtype=np.float32)
+            return m
+    except Exception:
+        return None
+    return None
+
+
+def _aformat_preset_matrix(preset: Optional[str]) -> Optional[np.ndarray]:
+    """Return a 4x4 A→B matrix for known presets. Currently supports 'generic'."""
+    if not preset:
+        return None
+    p = preset.lower()
+    if p == 'generic':
+        # Assume channel order: [FL, FR, BL, BR] on a horizontal square.
+        # SN3D-ish scaling; Z omitted.
+        return np.array([
+            [0.5,  0.5,  0.5,  0.5],  # W
+            [0.5,  0.5, -0.5, -0.5],  # X (front-back)
+            [0.5, -0.5,  0.5, -0.5],  # Y (left-right)
+            [0.0,  0.0,  0.0,  0.0],  # Z
+        ], dtype=np.float32)
+    return None
+
+
+def make_ambisonics_aformat_transform(matrix: np.ndarray, kind: str):
+    """Convert A-format (4 capsules) to B-format via 4x4 matrix, then decode to stereo (FOA horizontal)."""
+    if matrix.shape != (4, 4):
+        raise ValueError('A→B matrix must be 4x4')
+    def transform(block: np.ndarray) -> np.ndarray:
+        if block.ndim != 2 or block.shape[1] != 4:
+            raise ValueError('A-format block must be (frames, 4)')
+        b = block.astype(np.float32, copy=False)
+        B = b @ matrix.T  # frames x 4 -> W,X,Y,Z
+        W = B[:, 0]
+        X = B[:, 1]
+        Y = B[:, 2]
+        # Z = B[:, 3]  # unused for horizontal decode
+        L = W + SQRT1_2 * X + SQRT1_2 * Y
+        R = W + SQRT1_2 * X - SQRT1_2 * Y
+        return np.stack([L, R], axis=1)
+    return transform
 
 def downmix_block(block: np.ndarray) -> np.ndarray:
     """
@@ -590,7 +744,9 @@ def _bits_for_subtype(subtype: Optional[str]) -> Optional[int]:
 def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite: bool,
                  subtype: Optional[str], normalize: bool, chunk_size: int,
                  preserve_originals_subdir: Optional[str] = None,
-                 verbose: int = 0) -> Dict[str, Any]:
+                 verbose: int = 0,
+                 aformat_preset: Optional[str] = None,
+                 aformat_matrix: Optional[Path] = None) -> Dict[str, Any]:
     """Downmix a single file.
 
     If preserve_originals_subdir is provided and the file has >=3 channels, the original file is moved to a
@@ -623,15 +779,54 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             # Determine output subtype: preserve unless explicitly set
             out_subtype = subtype or sfi.subtype or 'PCM_16'
             # Choose transform
-            # Prefer mask-based transform if available
-            mask = parse_wav_channel_mask(backup_path)
-            roles = roles_from_mask(mask, sfi.channels)
-            if not roles:
+            # Prefer Ambisonics first (bias)
+            ambi_roles, ambi_kind, ambi_info = detect_ambisonics(backup_path, sfi.channels)
+            detection_notes: Optional[Dict[str, Any]] = None
+            layout = None
+            mask = None
+            roles = None
+            transform = None
+            transform_name = 'passthrough' if sfi.channels == 2 else None
+            if ambi_info and ambi_info.get('format') == 'A':
+                # A-format detected: attempt A→B using provided matrix/preset
+                mat = None
+                if aformat_matrix:
+                    mat = _load_matrix_from_json(aformat_matrix)
+                if mat is None and aformat_preset:
+                    mat = _aformat_preset_matrix(aformat_preset)
+                if mat is not None and sfi.channels == 4:
+                    transform = make_ambisonics_aformat_transform(mat, 'FuMa')
+                    roles = ['W', 'X', 'Y', 'Z']
+                    transform_name = 'ambisonics-aformat+ab'
+                    detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': 'FuMa', 'info': ambi_info, 'aformat': {'preset': aformat_preset, 'matrix': str(aformat_matrix) if aformat_matrix else None}}}
+                else:
+                    # No matrix -> leave transform None to fall back
+                    detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
+            elif ambi_roles:
+                roles = ambi_roles
+                tm = make_ambisonics_transform(roles, ambi_kind)
+                transform = tm
+                transform_name = f"ambisonics-{ambi_kind.lower()}"
+                detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': ambi_kind, 'info': ambi_info}}
+            if transform is None:
+                mask = parse_wav_channel_mask(backup_path)
+                roles = roles_from_mask(mask, sfi.channels)
+                if roles:
+                    tm = make_roles_transform(roles)
+                    transform = tm or downmix_block
+                    transform_name = 'mask'
+            if transform is None:
                 layout = _ffprobe_layout(backup_path)
                 roles = roles_from_ffprobe_layout(layout, sfi.channels)
-            tm = make_roles_transform(roles)
-            transform = (lambda x: x) if sfi.channels == 2 else (tm or downmix_block)
-            transform_name = 'passthrough' if sfi.channels == 2 else ('mask' if roles_from_mask(mask, sfi.channels) else ('ffprobe' if tm is not None else 'heuristic'))
+                if roles:
+                    tm = make_roles_transform(roles)
+                    transform = tm or downmix_block
+                    transform_name = 'ffprobe'
+            if transform is None:
+                roles = heuristic_roles_for_channels(sfi.channels)
+                tm = make_roles_transform(roles) if roles else None
+                transform = tm or downmix_block
+                transform_name = 'heuristic'
             # Normalize using global peak if requested
             if normalize:
                 peak = _compute_peak(backup_path, chunk_size=chunk_size, transform=transform)
@@ -682,6 +877,8 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                 "transform": transform_name,
             },
         }
+        if detection_notes:
+            details.update(detection_notes)
         if verbose >= 2:
             details["metadata"] = {
                 "ffmpeg": bool(_ffmpeg_path()),
@@ -703,14 +900,52 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
 
     with sf.SoundFile(str(in_path), mode='r') as sfi:
         out_subtype = subtype or sfi.subtype or 'PCM_16'
-        mask = parse_wav_channel_mask(in_path)
-        roles = roles_from_mask(mask, ch)
-        if not roles:
+        # Prefer Ambisonics first (bias)
+        ambi_roles, ambi_kind, ambi_info = detect_ambisonics(in_path, ch)
+        detection_notes: Optional[Dict[str, Any]] = None
+        layout = None
+        mask = None
+        roles = None
+        transform = None
+        transform_name = 'passthrough' if ch == 2 else None
+        if ambi_info and ambi_info.get('format') == 'A':
+            mat = None
+            if aformat_matrix:
+                mat = _load_matrix_from_json(aformat_matrix)
+            if mat is None and aformat_preset:
+                mat = _aformat_preset_matrix(aformat_preset)
+            if mat is not None and ch == 4:
+                transform = make_ambisonics_aformat_transform(mat, 'FuMa')
+                roles = ['W', 'X', 'Y', 'Z']
+                transform_name = 'ambisonics-aformat+ab'
+                detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': 'FuMa', 'info': ambi_info, 'aformat': {'preset': aformat_preset, 'matrix': str(aformat_matrix) if aformat_matrix else None}}}
+            else:
+                detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
+        elif ambi_roles:
+            roles = ambi_roles
+            tm = make_ambisonics_transform(roles, ambi_kind)
+            transform = tm
+            transform_name = f"ambisonics-{ambi_kind.lower()}"
+            detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': ambi_kind, 'info': ambi_info}}
+        if transform is None:
+            mask = parse_wav_channel_mask(in_path)
+            roles = roles_from_mask(mask, ch)
+            if roles:
+                tm = make_roles_transform(roles)
+                transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
+                transform_name = 'mask'
+        if transform is None:
             layout = _ffprobe_layout(in_path)
             roles = roles_from_ffprobe_layout(layout, ch)
-        tm = make_roles_transform(roles)
-        transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
-        transform_name = 'passthrough' if ch == 2 else ('mask' if roles_from_mask(mask, ch) else ('ffprobe' if tm is not None else 'heuristic'))
+            if roles:
+                tm = make_roles_transform(roles)
+                transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
+                transform_name = 'ffprobe'
+        if transform is None:
+            roles = heuristic_roles_for_channels(ch)
+            tm = make_roles_transform(roles) if roles else None
+            transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
+            transform_name = 'heuristic'
         if normalize:
             peak = _compute_peak(in_path, chunk_size=chunk_size, transform=transform)
             scale = (1.0 / peak) if peak > 1.0 else 1.0
@@ -749,6 +984,8 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                 "transform": transform_name,
             },
         }
+        if detection_notes:
+            details.update(detection_notes)
         if verbose >= 2:
             details["metadata"] = {
                 "ffmpeg": bool(_ffmpeg_path()),
@@ -781,6 +1018,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--normalize', dest='normalize', action='store_true', default=True, help='Normalize to avoid clipping using global peak (default: on).')
     ap.add_argument('--no-normalize', dest='normalize', action='store_false', help='Disable normalization.')
     ap.add_argument('--chunk-size', type=int, default=262144, help='Frames per processing block (default: 262144).')
+    ap.add_argument('--aformat-preset', choices=['generic'], default=None, help='If Ambisonics A-format is detected, use this preset 4x4 A→B matrix before decoding (experimental).')
+    ap.add_argument('--aformat-matrix', type=Path, default=None, help='Path to JSON file containing a 4x4 A→B matrix (rows=W,X,Y,Z; cols=channels 1..4). Overrides --aformat-preset.')
     ap.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v or -vv).')
 
     args = ap.parse_args(argv)
@@ -829,6 +1068,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 chunk_size=args.chunk_size,
                 preserve_originals_subdir=args.preserve_originals,
                 verbose=args.verbose,
+                aformat_preset=args.aformat_preset,
+                aformat_matrix=args.aformat_matrix,
             )
         except Exception as e:
             res = {"path": str(fpath), "error": str(e)}
@@ -852,6 +1093,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             src = d.get('source', {})
             dst = d.get('dest', {})
             print(f"  Original: {src.get('channels')} channels @ {src.get('samplerate')} Hz, {src.get('subtype')} ({src.get('bits')}‑bit)")
+            # Ambisonics detection info (if applicable)
+            ambi = d.get('ambisonics')
+            if ambi and ambi.get('detected'):
+                fmt = ambi.get('format')
+                kind = ambi.get('kind')
+                ev = (ambi.get('info') or {}).get('evidence') or []
+                if fmt == 'A':
+                    ainfo = ambi.get('aformat') or {}
+                    if ainfo.get('matrix') or ainfo.get('preset'):
+                        used = ainfo.get('preset') or 'custom-matrix'
+                        print(f"  Ambisonics: A-format detected based on: {', '.join(ev) if ev else 'indicators'}; converted A→B using preset '{used}'")
+                    else:
+                        print(f"  Ambisonics: A-format detected based on: {', '.join(ev) if ev else 'indicators'}; no A→B provided — using non-ambisonic downmix fallback")
+                else:
+                    print(f"  Ambisonics: detected as {kind} based on: {', '.join(ev) if ev else 'unspecified indicators'}")
             # Friendly layout and downmix plan
             roles = src.get('roles')
             shown_layout = False
@@ -878,7 +1134,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print("  Channel layout: not signaled; using generic averaging")
             # Always show a downmix plan
             if roles:
-                left_desc, right_desc = describe_downmix_from_roles(roles)
+                if isinstance(dst.get('transform'), str) and dst.get('transform', '').startswith('ambisonics-'):
+                    left_desc, right_desc = describe_downmix_from_ambisonics(roles)
+                else:
+                    left_desc, right_desc = describe_downmix_from_roles(roles)
                 print(f"  Downmix plan → Left:  {left_desc}")
                 print(f"                 Right: {right_desc}")
             norm_txt = f"on (scale {dst.get('scale'):.3f})" if dst.get('normalize') else "off"
@@ -886,14 +1145,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.verbose >= 2 and d.get('metadata'):
                 md = d['metadata']
                 print(f"  Metadata propagation via ffmpeg: {'yes' if md.get('ffmpeg') else 'no'}; ffprobe available: {'yes' if md.get('ffprobe') else 'no'}")
-                before = r.get('details', {}).get('metadata', {})
-                # Show each key before with value and whether propagated
-                before_keys = before.get('before_keys')
-                after_keys = before.get('after_keys')
-                # Re-probe full tags for values
+                # Re-probe full tags for values and provide a summary
                 src_tags = _ffprobe_tags(Path(r['path'])) or {}
                 dst_tags = _ffprobe_tags(Path(r['out'])) or {}
-                for k in sorted(src_tags.keys()):
+                src_keys = set(src_tags.keys())
+                dst_keys = set(dst_tags.keys())
+                missing_keys = sorted(list(src_keys - dst_keys))
+                common_keys = sorted(list(src_keys & dst_keys))
+                changed_keys = [k for k in common_keys if str(src_tags.get(k)) != str(dst_tags.get(k))]
+                propagated_keys = [k for k in common_keys if str(src_tags.get(k)) == str(dst_tags.get(k))]
+                print(f"  Metadata summary: before={len(src_keys)}, after={len(dst_keys)}, propagated={len(propagated_keys)}, changed={len(changed_keys)}, missing={len(missing_keys)}")
+                for k in sorted(src_keys):
                     v_before = src_tags.get(k)
                     v_after = dst_tags.get(k)
                     if v_after is None:
