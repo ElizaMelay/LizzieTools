@@ -17,7 +17,7 @@ Downmix heuristics (common layouts, ITU-ish weights):
 
 If channel order is unknown, falls back to averaging surrounds where reasonable; otherwise averages all channels equally as a last resort.
 
-By default outputs 16-bit PCM stereo, preserving sample rate. Can normalize to avoid clipping.
+By default preserves the original file's subtype (bit depth/format) and sample rate. Can normalize to avoid clipping.
 """
 from __future__ import annotations
 
@@ -168,8 +168,24 @@ def _unique_sibling_path(base_path: Path) -> Path:
         i += 1
 
 
-def _write_streamed(sfi: sf.SoundFile, out_path: Path, subtype: str, normalize: bool, chunk_size: int,
-                    transform) -> None:
+def _compute_peak(path: Path, chunk_size: int, transform) -> float:
+    """Compute a global peak of the transformed signal by scanning once."""
+    peak = 0.0
+    with sf.SoundFile(str(path), mode='r') as sfi:
+        while True:
+            data = sfi.read(frames=chunk_size, dtype='float32', always_2d=True)
+            if data.size == 0:
+                break
+            out = transform(data)
+            if out.size:
+                p = float(np.max(np.abs(out)))
+                if p > peak:
+                    peak = p
+    return peak
+
+
+def _write_streamed(sfi: sf.SoundFile, out_path: Path, subtype: str, chunk_size: int,
+                    transform, scale: float = 1.0) -> None:
     sr = sfi.samplerate
     with sf.SoundFile(str(out_path), mode='w', samplerate=sr, channels=2, subtype=subtype) as sfo:
         while True:
@@ -177,15 +193,13 @@ def _write_streamed(sfi: sf.SoundFile, out_path: Path, subtype: str, normalize: 
             if data.size == 0:
                 break
             out = transform(data)
-            if normalize:
-                peak = float(np.max(np.abs(out)))
-                if peak > 1.0 and peak > 0.0:
-                    out = out / peak
+            if scale != 1.0:
+                out = out * scale
             sfo.write(out)
 
 
 def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite: bool,
-                 subtype: str, normalize: bool, chunk_size: int,
+                 subtype: Optional[str], normalize: bool, chunk_size: int,
                  preserve_originals_subdir: Optional[str] = None) -> Dict[str, Any]:
     """Downmix a single file.
 
@@ -216,11 +230,18 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             return {"path": str(in_path), "out": str(out_path), "skipped": True, "reason": "exists"}
 
         with sf.SoundFile(str(backup_path), mode='r') as sfi:
-            # If the moved file was actually stereo (edge case), we can pass-through
-            if sfi.channels == 2:
-                _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=lambda x: x)
+            # Determine output subtype: preserve unless explicitly set
+            out_subtype = subtype or sfi.subtype or 'PCM_16'
+            # Choose transform
+            transform = (lambda x: x) if sfi.channels == 2 else downmix_block
+            # Normalize using global peak if requested
+            if normalize:
+                peak = _compute_peak(backup_path, chunk_size=chunk_size, transform=transform)
+                scale = (1.0 / peak) if peak > 1.0 else 1.0
+                _ = sfi.seek(0)
+                _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=scale)
             else:
-                _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=downmix_block)
+                _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=1.0)
 
         return {"path": str(in_path), "out": str(out_path), "backup": str(backup_path), "sr": sr, "in_channels": ch, "out_channels": 2}
 
@@ -232,13 +253,16 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         return {"path": str(in_path), "out": str(out_path), "skipped": True, "reason": "exists"}
 
     with sf.SoundFile(str(in_path), mode='r') as sfi:
-        if ch == 2:
-            # Pass through stereo copy
-            _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=lambda x: x)
-            return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        out_subtype = subtype or sfi.subtype or 'PCM_16'
+        transform = (lambda x: x) if ch == 2 else downmix_block
+        if normalize:
+            peak = _compute_peak(in_path, chunk_size=chunk_size, transform=transform)
+            scale = (1.0 / peak) if peak > 1.0 else 1.0
+            _ = sfi.seek(0)
         else:
-            _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=downmix_block)
-            return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+            scale = 1.0
+        _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=scale)
+        return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
 
 # ---------- CLI ----------
 
@@ -256,8 +280,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--overwrite', action='store_true', help='Overwrite existing outputs.')
     ap.add_argument('--preserve-originals', nargs='?', const='multitrack_originals', default=None,
                     help="Move original multi-channel files into this subfolder near the source, then write the stereo mix back to the original file path. If used without a value, defaults to 'multitrack_originals'. When set, ignores --out-dir and --suffix for affected files.")
-    ap.add_argument('--subtype', default='PCM_16', help='Output subtype: PCM_16, PCM_24, PCM_32, FLOAT, etc. (default: PCM_16).')
-    ap.add_argument('--normalize', dest='normalize', action='store_true', default=True, help='Normalize to avoid clipping (default: on).')
+    ap.add_argument('--subtype', default=None, help='Output subtype (e.g., PCM_16, PCM_24, PCM_32, FLOAT). Default: preserve original subtype.')
+    ap.add_argument('--normalize', dest='normalize', action='store_true', default=True, help='Normalize to avoid clipping using global peak (default: on).')
     ap.add_argument('--no-normalize', dest='normalize', action='store_false', help='Disable normalization.')
     ap.add_argument('--chunk-size', type=int, default=262144, help='Frames per processing block (default: 262144).')
 
