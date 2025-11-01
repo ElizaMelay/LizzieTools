@@ -32,7 +32,8 @@ import soundfile as sf
 
 # ---------- Input discovery ----------
 
-def _load_json_paths(path: Optional[Path], from_stdin: bool) -> List[Path]:
+def _load_json_items(path: Optional[Path], from_stdin: bool) -> List[Dict[str, Any]]:
+    """Load JSON array of items and return list with at least {'path', 'channels'?} per item."""
     data = None
     if from_stdin:
         text = os.sys.stdin.read()
@@ -43,20 +44,18 @@ def _load_json_paths(path: Optional[Path], from_stdin: bool) -> List[Path]:
     else:
         return []
 
-    paths: List[Path] = []
+    items: List[Dict[str, Any]] = []
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict) and 'path' in item:
-                ch = item.get('channels')
-                # Only include multi-channel by default; singletons handled by CLI filter
                 p = Path(str(item['path']))
                 if p.suffix.lower() == '.wav':
-                    paths.append(p)
+                    items.append({'path': str(p), 'channels': item.get('channels')})
             elif isinstance(item, str):
                 p = Path(item)
                 if p.suffix.lower() == '.wav':
-                    paths.append(p)
-    return paths
+                    items.append({'path': str(p)})
+    return items
 
 
 def _iter_paths(inputs: List[Path], recursive: bool) -> Iterable[Path]:
@@ -220,29 +219,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     inputs: List[Path]
-    if args.from_json or args.from_stdin:
-        inputs = _load_json_paths(args.from_json, args.from_stdin)
-    else:
-        inputs = [Path(p) for p in args.paths]
-
     files: List[Path] = []
     if args.from_json or args.from_stdin:
-        # When reading JSON, filter to multi-channel if requested
-        for p in inputs:
+        items = _load_json_items(args.from_json, args.from_stdin)
+        for it in items:
+            p = Path(it['path'])
             if p.suffix.lower() != '.wav':
                 continue
             if args.only_multi:
-                # We don't have channel info per-path unless JSON contained it; to be safe, inspect header via soundfile
-                try:
-                    with sf.SoundFile(str(p), mode='r') as sfi:
-                        if sfi.channels >= 3:
-                            files.append(p)
-                except Exception:
-                    # Skip unreadable files
-                    pass
+                ch = it.get('channels')
+                if isinstance(ch, int):
+                    if ch >= 3:
+                        files.append(p)
+                else:
+                    # Fallback: probe header when channel info missing
+                    try:
+                        with sf.SoundFile(str(p), mode='r') as sfi:
+                            if sfi.channels >= 3:
+                                files.append(p)
+                    except Exception:
+                        pass
             else:
                 files.append(p)
     else:
+        inputs = [Path(p) for p in args.paths]
         files = list(_iter_paths(inputs, recursive=args.recursive))
 
     if not files:

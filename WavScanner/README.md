@@ -50,7 +50,11 @@ Use `mixdown_wav_to_stereo.py` to convert multi-channel WAVs into stereo with se
 # Install deps (inside the repo venv)
 C:/LizzieTools/WavScanner/.venv/Scripts/python.exe -m pip install -r .\requirements.txt
 
-# Downmix from scanner JSON output
+# Pipe scanner JSON directly into mixdown (PowerShell pipeline)
+C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\scan_wav_channels.py C:\Path\To\Wavs -r --json |
+	C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py --from-stdin --only-multi --out-dir .\stereo
+
+# Or downmix from a saved JSON file
 C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py --from-json .\scan_output.json --only-multi --out-dir .\stereo
 
 # Or downmix all WAVs in a folder (recursively)
@@ -62,7 +66,7 @@ C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:
 
 Options:
 - `--from-json` or `--from-stdin` to read the list from the scanner’s JSON output
-- `--only-multi` to process only files with 3+ channels (when scanning JSON or probing headers)
+- `--only-multi` to process only files with 3+ channels (uses `channels` from JSON when present; otherwise probes headers)
 - `--subtype` to choose output format (PCM_16 default; PCM_24/PCM_32/FLOAT supported)
 - `--normalize/--no-normalize` to control clipping protection
 - `--chunk-size` frames per block for large files
