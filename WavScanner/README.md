@@ -71,6 +71,40 @@ Options:
 - `--normalize/--no-normalize` to control clipping protection
 - `--chunk-size` frames per block for large files
 
+### Metadata preservation (ffmpeg required)
+
+To preserve RIFF/BWF/iXML/INFO metadata (e.g., Title, Artist, Description, CodingHistory), this tool uses `ffmpeg` to copy metadata onto the newly written stereo WAV. If `ffmpeg` isn't found, the audio will still be produced but metadata won't be preserved. The script will output a note at the end when metadata wasn't preserved and how to set up ffmpeg.
+
+Install ffmpeg on Windows and ensure `ffmpeg` and `ffprobe` are on your PATH:
+
+```powershell
+# Option A: Chocolatey
+choco install ffmpeg
+
+# Option B: winget
+winget install Gyan.FFmpeg
+# or
+winget install ffmpeg
+
+# Option C: Manual
+# Download a static build from a trusted source (e.g., https://www.gyan.dev/ffmpeg/builds/)
+# Unzip and add the 'bin' folder to your System PATH
+
+# Verify
+ffmpeg -version
+ffprobe -version
+```
+
+Once installed, rerun the mixdown. For debugging, use verbosity flags:
+
+```powershell
+# -v: show parsed args interpretation and per-file basics (channels, subtype in->out, transform used)
+C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r -v
+
+# -vv: add internals (WAVEFORMATEXTENSIBLE mask details, metadata keys before/after copy)
+C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r -vv
+```
+
 In-place replacement while preserving originals:
 
 ```powershell
@@ -86,4 +120,4 @@ Notes:
 - `--preserve-originals [folder]` moves only multi-channel sources (3+ ch). Stereo files are left untouched.
 - When `--preserve-originals` is set, `--out-dir` and `--suffix` are ignored for affected files.
 
-Downmix heuristics follow common layouts (3.0/4.0/5.0/5.1/7.1) with ITU-like weights (e.g., C at -3 dB into L/R, LFE at -6 to -12 dB). When layout is unknown, it falls back to a reasonable average.
+Downmix logic prefers the WAVEFORMATEXTENSIBLE channel mask when present to map channels correctly (e.g., 3F/LFE). If no mask is present, heuristics follow common layouts (3.0/4.0/5.0/5.1/7.1) with ITU-like weights (e.g., C at -3 dB into L/R, LFE at -6 to -12 dB). When layout is unknown, it falls back to a reasonable average.

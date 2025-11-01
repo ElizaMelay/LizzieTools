@@ -329,9 +329,55 @@ def _copy_metadata_with_ffmpeg(dst_audio: Path, src_meta: Path) -> Optional[str]
         return str(e)
 
 
+def _ffprobe_path() -> Optional[str]:
+    exe = shutil.which('ffprobe') or shutil.which('ffprobe.exe')
+    return exe
+
+
+def _ffprobe_tags(path: Path) -> Optional[Dict[str, Any]]:
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, '-v', 'error', '-show_entries', 'format:stream', '-print_format', 'json', str(path)]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout.decode('utf-8', errors='ignore'))
+        tags: Dict[str, Any] = {}
+        fmt = data.get('format', {})
+        if isinstance(fmt, dict) and 'tags' in fmt and isinstance(fmt['tags'], dict):
+            tags.update(fmt['tags'])
+        for st in data.get('streams', []) or []:
+            if isinstance(st, dict) and st.get('codec_type') == 'audio' and isinstance(st.get('tags'), dict):
+                for k, v in st['tags'].items():
+                    tags.setdefault(k, v)
+        return tags
+    except Exception:
+        return None
+
+
+BITS_PER_SUBTYPE = {
+    'PCM_U8': 8,
+    'PCM_S8': 8,
+    'PCM_16': 16,
+    'PCM_24': 24,
+    'PCM_32': 32,
+    'FLOAT': 32,
+    'DOUBLE': 64,
+}
+
+
+def _bits_for_subtype(subtype: Optional[str]) -> Optional[int]:
+    if not subtype:
+        return None
+    return BITS_PER_SUBTYPE.get(subtype)
+
+
 def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite: bool,
                  subtype: Optional[str], normalize: bool, chunk_size: int,
-                 preserve_originals_subdir: Optional[str] = None) -> Dict[str, Any]:
+                 preserve_originals_subdir: Optional[str] = None,
+                 verbose: int = 0) -> Dict[str, Any]:
     """Downmix a single file.
 
     If preserve_originals_subdir is provided and the file has >=3 channels, the original file is moved to a
@@ -367,6 +413,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             # Prefer mask-based transform if available
             mask = parse_wav_channel_mask(backup_path)
             transform = (lambda x: x) if sfi.channels == 2 else (make_mask_transform(mask, sfi.channels) or downmix_block)
+            transform_name = 'passthrough' if sfi.channels == 2 else ('mask' if make_mask_transform(mask, sfi.channels) else 'heuristic')
             # Normalize using global peak if requested
             if normalize:
                 peak = _compute_peak(backup_path, chunk_size=chunk_size, transform=transform)
@@ -376,8 +423,45 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             else:
                 _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=1.0)
 
+        # Metadata copy (post-write)
+        meta_before = _ffprobe_tags(backup_path) if verbose >= 2 else None
         meta_err = _copy_metadata_with_ffmpeg(out_path, backup_path)
-        result = {"path": str(in_path), "out": str(out_path), "backup": str(backup_path), "sr": sr, "in_channels": ch, "out_channels": 2}
+        meta_after = _ffprobe_tags(out_path) if verbose >= 2 else None
+
+        bits_in = _bits_for_subtype(sfi.subtype)
+        bits_out = _bits_for_subtype(out_subtype)
+        result: Dict[str, Any] = {
+            "path": str(in_path),
+            "out": str(out_path),
+            "backup": str(backup_path),
+            "sr": sr,
+            "in_channels": ch,
+            "out_channels": 2,
+        }
+        details: Dict[str, Any] = {
+            "source": {
+                "channels": ch,
+                "samplerate": sr,
+                "subtype": sfi.subtype,
+                "bits": bits_in,
+                "mask": f"0x{mask:08X}" if mask is not None else None,
+            },
+            "dest": {
+                "subtype": out_subtype,
+                "bits": bits_out,
+                "normalize": normalize,
+                "scale": scale if normalize else 1.0,
+                "transform": transform_name,
+            },
+        }
+        if verbose >= 2:
+            details["metadata"] = {
+                "ffmpeg": bool(_ffmpeg_path()),
+                "ffprobe": bool(_ffprobe_path()),
+                "before_keys": sorted(list(meta_before.keys())) if isinstance(meta_before, dict) else None,
+                "after_keys": sorted(list(meta_after.keys())) if isinstance(meta_after, dict) else None,
+            }
+        result["details"] = details
         if meta_err:
             result["metadata_warning"] = meta_err
         return result
@@ -392,7 +476,9 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
     with sf.SoundFile(str(in_path), mode='r') as sfi:
         out_subtype = subtype or sfi.subtype or 'PCM_16'
         mask = parse_wav_channel_mask(in_path)
-        transform = (lambda x: x) if ch == 2 else (make_mask_transform(mask, ch) or downmix_block)
+        tm = make_mask_transform(mask, ch)
+        transform = (lambda x: x) if ch == 2 else (tm or downmix_block)
+        transform_name = 'passthrough' if ch == 2 else ('mask' if tm is not None else 'heuristic')
         if normalize:
             peak = _compute_peak(in_path, chunk_size=chunk_size, transform=transform)
             scale = (1.0 / peak) if peak > 1.0 else 1.0
@@ -400,8 +486,36 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         else:
             scale = 1.0
         _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=scale)
+        meta_before = _ffprobe_tags(in_path) if verbose >= 2 else None
         meta_err = _copy_metadata_with_ffmpeg(out_path, in_path)
-        result = {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        meta_after = _ffprobe_tags(out_path) if verbose >= 2 else None
+        bits_in = _bits_for_subtype(sfi.subtype)
+        bits_out = _bits_for_subtype(out_subtype)
+        result: Dict[str, Any] = {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        details: Dict[str, Any] = {
+            "source": {
+                "channels": ch,
+                "samplerate": sfi.samplerate,
+                "subtype": sfi.subtype,
+                "bits": bits_in,
+                "mask": f"0x{mask:08X}" if mask is not None else None,
+            },
+            "dest": {
+                "subtype": out_subtype,
+                "bits": bits_out,
+                "normalize": normalize,
+                "scale": scale if normalize else 1.0,
+                "transform": transform_name,
+            },
+        }
+        if verbose >= 2:
+            details["metadata"] = {
+                "ffmpeg": bool(_ffmpeg_path()),
+                "ffprobe": bool(_ffprobe_path()),
+                "before_keys": sorted(list(meta_before.keys())) if isinstance(meta_before, dict) else None,
+                "after_keys": sorted(list(meta_after.keys())) if isinstance(meta_after, dict) else None,
+            }
+        result["details"] = details
         if meta_err:
             result["metadata_warning"] = meta_err
         return result
@@ -426,6 +540,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--normalize', dest='normalize', action='store_true', default=True, help='Normalize to avoid clipping using global peak (default: on).')
     ap.add_argument('--no-normalize', dest='normalize', action='store_false', help='Disable normalization.')
     ap.add_argument('--chunk-size', type=int, default=262144, help='Frames per processing block (default: 262144).')
+    ap.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v or -vv).')
 
     args = ap.parse_args(argv)
 
@@ -472,6 +587,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 normalize=args.normalize,
                 chunk_size=args.chunk_size,
                 preserve_originals_subdir=args.preserve_originals,
+                verbose=args.verbose,
             )
         except Exception as e:
             res = {"path": str(fpath), "error": str(e)}
@@ -489,6 +605,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"SKIP: {r['path']} -> {r['out']} (exists)")
         else:
             print(f"OK: {r['path']} -> {r['out']}")
+
+        if args.verbose >= 1 and r.get('details'):
+            d = r['details']
+            src = d.get('source', {})
+            dst = d.get('dest', {})
+            print(f"  src: channels={src.get('channels')} sr={src.get('samplerate')} subtype={src.get('subtype')} bits={src.get('bits')} mask={src.get('mask')}")
+            print(f"  dst: subtype={dst.get('subtype')} bits={dst.get('bits')} transform={dst.get('transform')} normalize={dst.get('normalize')} scale={dst.get('scale')}")
+            if args.verbose >= 2 and d.get('metadata'):
+                md = d['metadata']
+                print(f"  metadata: ffmpeg={md.get('ffmpeg')} ffprobe={md.get('ffprobe')}")
+                print(f"  metadata keys before: {md.get('before_keys')}")
+                print(f"  metadata keys after:  {md.get('after_keys')}")
+
+    # If any metadata could not be preserved, print guidance on ffmpeg setup
+    if any(r.get('metadata_warning') for r in results):
+        print("\nNote: Some files did not have metadata preserved.")
+        print("- This tool relies on ffmpeg to copy RIFF/BWF/iXML tags into the new file.")
+        print("- Install ffmpeg and ensure 'ffmpeg' and 'ffprobe' are on your PATH, then re-run.")
+        print("Windows quick options:")
+        print("  1) Chocolatey:   choco install ffmpeg")
+        print("  2) Winget:        winget install Gyan.FFmpeg or winget install ffmpeg")
+        print("  3) Manual:        Download a static build (e.g., from gyan.dev), unzip, add the 'bin' folder to PATH")
+        print("Verify:  ffmpeg -version   and   ffprobe -version")
 
     return 0
 
