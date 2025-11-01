@@ -71,4 +71,19 @@ Options:
 - `--normalize/--no-normalize` to control clipping protection
 - `--chunk-size` frames per block for large files
 
+In-place replacement while preserving originals:
+
+```powershell
+# Moves each multi-channel original into a sibling subfolder (default 'multitrack_originals')
+# and writes the stereo mix back to the original file path
+C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r --preserve-originals --overwrite
+
+# Use a custom subfolder name for originals
+C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r --preserve-originals _original_multitrack --overwrite
+```
+
+Notes:
+- `--preserve-originals [folder]` moves only multi-channel sources (3+ ch). Stereo files are left untouched.
+- When `--preserve-originals` is set, `--out-dir` and `--suffix` are ignored for affected files.
+
 Downmix heuristics follow common layouts (3.0/4.0/5.0/5.1/7.1) with ITU-like weights (e.g., C at -3 dB into L/R, LFE at -6 to -12 dB). When layout is unknown, it falls back to a reasonable average.

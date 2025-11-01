@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import os
 from pathlib import Path
 from typing import Iterable, List, Optional, Dict, Any, Tuple
@@ -155,8 +156,75 @@ def downmix_block(block: np.ndarray) -> np.ndarray:
 
 # ---------- Processing ----------
 
+def _unique_sibling_path(base_path: Path) -> Path:
+    """Return a non-colliding path by appending (n) before the suffix if needed."""
+    if not base_path.exists():
+        return base_path
+    i = 1
+    while True:
+        candidate = base_path.with_name(f"{base_path.stem} ({i}){base_path.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _write_streamed(sfi: sf.SoundFile, out_path: Path, subtype: str, normalize: bool, chunk_size: int,
+                    transform) -> None:
+    sr = sfi.samplerate
+    with sf.SoundFile(str(out_path), mode='w', samplerate=sr, channels=2, subtype=subtype) as sfo:
+        while True:
+            data = sfi.read(frames=chunk_size, dtype='float32', always_2d=True)
+            if data.size == 0:
+                break
+            out = transform(data)
+            if normalize:
+                peak = float(np.max(np.abs(out)))
+                if peak > 1.0 and peak > 0.0:
+                    out = out / peak
+            sfo.write(out)
+
+
 def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite: bool,
-                 subtype: str, normalize: bool, chunk_size: int) -> Dict[str, Any]:
+                 subtype: str, normalize: bool, chunk_size: int,
+                 preserve_originals_subdir: Optional[str] = None) -> Dict[str, Any]:
+    """Downmix a single file.
+
+    If preserve_originals_subdir is provided and the file has >=3 channels, the original file is moved to a
+    sibling subfolder (creating it if needed), and the stereo mix is written back to the original file path.
+    Otherwise, the stereo mix is written to out_dir/stem+suffix.wav.
+    """
+    # First, peek channel count safely
+    try:
+        with sf.SoundFile(str(in_path), mode='r') as peek:
+            sr = peek.samplerate
+            ch = peek.channels
+    except Exception as e:
+        return {"path": str(in_path), "error": str(e)}
+
+    # In preserve-originals mode, only act on multi-channel files
+    if preserve_originals_subdir and ch >= 3:
+        backup_dir = in_path.parent / preserve_originals_subdir
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = _unique_sibling_path(backup_dir / in_path.name)
+
+        # Move the original to backup, then read from backup and write to original path
+        shutil.move(str(in_path), str(backup_path))
+
+        # If a stereo already exists at original path (rare), enforce overwrite behavior
+        out_path = in_path
+        if out_path.exists() and not overwrite:
+            return {"path": str(in_path), "out": str(out_path), "skipped": True, "reason": "exists"}
+
+        with sf.SoundFile(str(backup_path), mode='r') as sfi:
+            # If the moved file was actually stereo (edge case), we can pass-through
+            if sfi.channels == 2:
+                _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=lambda x: x)
+            else:
+                _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=downmix_block)
+
+        return {"path": str(in_path), "out": str(out_path), "backup": str(backup_path), "sr": sr, "in_channels": ch, "out_channels": 2}
+
+    # Not preserving originals: write to side-by-side output
     out_dir = out_dir or in_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{in_path.stem}{suffix}.wav"
@@ -164,38 +232,13 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         return {"path": str(in_path), "out": str(out_path), "skipped": True, "reason": "exists"}
 
     with sf.SoundFile(str(in_path), mode='r') as sfi:
-        sr = sfi.samplerate
-        ch = sfi.channels
         if ch == 2:
             # Pass through stereo copy
-            mode = 'w'
-            with sf.SoundFile(str(out_path), mode=mode, samplerate=sr, channels=2, subtype=subtype) as sfo:
-                while True:
-                    data = sfi.read(frames=chunk_size, dtype='float32', always_2d=True)
-                    if data.size == 0:
-                        break
-                    out = data  # already stereo float32
-                    if normalize:
-                        peak = np.max(np.abs(out))
-                        if peak > 1.0 and peak > 0:
-                            out = out / peak
-                    sfo.write(out)
-            return {"path": str(in_path), "out": str(out_path), "sr": sr, "in_channels": ch, "out_channels": 2}
-
-        mode = 'w'
-        with sf.SoundFile(str(out_path), mode=mode, samplerate=sr, channels=2, subtype=subtype) as sfo:
-            while True:
-                data = sfi.read(frames=chunk_size, dtype='float32', always_2d=True)
-                if data.size == 0:
-                    break
-                out = downmix_block(data)
-                if normalize:
-                    peak = np.max(np.abs(out))
-                    if peak > 1.0 and peak > 0:
-                        out = out / peak
-                sfo.write(out)
-
-    return {"path": str(in_path), "out": str(out_path), "sr": sr, "in_channels": ch, "out_channels": 2}
+            _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=lambda x: x)
+            return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        else:
+            _write_streamed(sfi, out_path, subtype=subtype, normalize=normalize, chunk_size=chunk_size, transform=downmix_block)
+            return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
 
 # ---------- CLI ----------
 
@@ -211,6 +254,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--out-dir', type=Path, help='Output directory (default: alongside source files).')
     ap.add_argument('--suffix', default='_stereo', help='Suffix to append to output filename (default: _stereo).')
     ap.add_argument('--overwrite', action='store_true', help='Overwrite existing outputs.')
+    ap.add_argument('--preserve-originals', nargs='?', const='multitrack_originals', default=None,
+                    help="Move original multi-channel files into this subfolder near the source, then write the stereo mix back to the original file path. If used without a value, defaults to 'multitrack_originals'. When set, ignores --out-dir and --suffix for affected files.")
     ap.add_argument('--subtype', default='PCM_16', help='Output subtype: PCM_16, PCM_24, PCM_32, FLOAT, etc. (default: PCM_16).')
     ap.add_argument('--normalize', dest='normalize', action='store_true', default=True, help='Normalize to avoid clipping (default: on).')
     ap.add_argument('--no-normalize', dest='normalize', action='store_false', help='Disable normalization.')
@@ -260,6 +305,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 subtype=args.subtype,
                 normalize=args.normalize,
                 chunk_size=args.chunk_size,
+                preserve_originals_subdir=args.preserve_originals,
             )
         except Exception as e:
             res = {"path": str(fpath), "error": str(e)}
