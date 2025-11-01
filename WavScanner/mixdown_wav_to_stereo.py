@@ -439,7 +439,7 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
         return None, None, info
     # Else assume B-format; decide FuMa vs AmbiX (ACN/SN3D) by keywords
     decider = 'default'
-    kind = 'FuMa'
+    kind = 'AmbiX'
     if ambix_hits and not fuma_hits:
         kind = 'AmbiX'
         decider = 'keyword-ambix'
@@ -447,7 +447,7 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
         kind = 'FuMa'
         decider = 'keyword-fuma'
     else:
-        # ambiguous; leave default 'FuMa' unless caller biases
+        # ambiguous; default to AmbiX (caller may still bias/override)
         decider = 'ambiguous'
     roles = ['W', 'Y', 'Z', 'X'] if kind == 'AmbiX' else ['W', 'X', 'Y', 'Z']
     info = {
@@ -495,6 +495,69 @@ def describe_downmix_from_ambisonics(roles: List[str]) -> Tuple[str, str]:
         left.append(f"{FRIENDLY_AMBI_ROLE['Y']} (-3.0 dB)")
         right.append(f"{FRIENDLY_AMBI_ROLE['Y']} (-3.0 dB, inverted to right)")
     return ', '.join(left), ', '.join(right)
+
+def _compute_channel_rms(path: Path, frames_limit: int = 262144) -> Optional[List[float]]:
+    """Compute per-channel RMS over up to frames_limit frames from the start of the file.
+    Returns list of floats length=channels, or None on error.
+    """
+    try:
+        with sf.SoundFile(str(path), mode='r') as sfi:
+            ch = sfi.channels
+            sumsqs = np.zeros((ch,), dtype=np.float64)
+            count = 0
+            remaining = frames_limit
+            block = 65536
+            while remaining > 0:
+                n = min(block, remaining)
+                data = sfi.read(frames=n, dtype='float32', always_2d=True)
+                if data.size == 0:
+                    break
+                sumsqs += np.sum(data.astype(np.float32) ** 2.0, axis=0, dtype=np.float64)
+                count += data.shape[0]
+                remaining -= data.shape[0]
+            if count == 0:
+                return [0.0] * ch
+            rms = np.sqrt(sumsqs / float(count))
+            return [float(x) for x in rms]
+    except Exception:
+        return None
+
+def _decide_ambix_fuma_by_energy(rms: List[float], min_diff_db: float = 3.0) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Given per-channel RMS for a 4-channel B-format file, decide AmbiX vs FuMa by
+    finding the lowest-energy among channels 1..3 (X/Y/Z candidates).
+    - If idx==2 -> AmbiX (Z at ch2)
+    - If idx==3 -> FuMa (Z at ch3)
+    - If idx==1 -> no confidence
+    Requires that min is at least min_diff_db below both others.
+    Returns (kind or None, info dict including confidence and indices).
+    """
+    info: Dict[str, Any] = {'method': 'energy-scan', 'rms': rms}
+    if rms is None or len(rms) < 4:
+        info['error'] = 'rms-unavailable'
+        return None, info
+    # Consider channels 1..3 (indexes)
+    arr = np.array(rms, dtype=np.float64)
+    subset = arr[1:4]
+    min_idx_local = int(np.argmin(subset))  # 0..2
+    min_idx = 1 + min_idx_local            # 1..3
+    # Compute dB diffs vs other two
+    min_val = subset[min_idx_local]
+    others = np.delete(subset, min_idx_local)
+    # avoid log of zero; add tiny eps
+    eps = 1e-12
+    db_min = 20.0 * np.log10(max(min_val, eps))
+    db_others = 20.0 * np.log10(np.maximum(others, eps))
+    diffs = db_others - db_min  # both should be >= min_diff_db to be confident
+    confidence_db = float(np.min(diffs)) if diffs.size > 0 else 0.0
+    info.update({'min_index': min_idx, 'confidence_db': confidence_db})
+    if confidence_db < float(min_diff_db):
+        # Not confidently lower
+        return None, info
+    if min_idx == 2:
+        return 'AmbiX', info
+    if min_idx == 3:
+        return 'FuMa', info
+    return None, info
 
 
 def _load_matrix_from_json(path: Path) -> Optional[np.ndarray]:
@@ -773,7 +836,9 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                  aformat_preset: Optional[str] = None,
                  aformat_matrix: Optional[Path] = None,
                  ambi_kind: str = 'auto',
-                 ambi_default: str = 'fuma') -> Dict[str, Any]:
+                 ambi_default: str = 'ambix',
+                 ambi_scan_frames: int = 262144,
+                 ambi_scan_min_diff_db: float = 3.0) -> Dict[str, Any]:
     """Downmix a single file.
 
     If preserve_originals_subdir is provided and the file has >=3 channels, the original file is moved to a
@@ -830,7 +895,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                     # No matrix -> leave transform None to fall back
                     detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
             elif ambi_roles:
-                # Allow override or default bias for ambiguous decisions
+                # Allow override or default bias for ambiguous decisions, with optional energy scan
                 chosen_kind = ambi_kind
                 info_decider = (ambi_info or {}).get('decider') if isinstance(ambi_info, dict) else None
                 detected_kind = ambi_kind if ambi_kind in ('fuma', 'ambix') else (ambi_kind if ambi_kind in ('FuMa','AmbiX') else None)
@@ -839,25 +904,38 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                 if ambi_kind_norm in ('fuma', 'ambix'):
                     chosen_kind = 'AmbiX' if ambi_kind_norm == 'ambix' else 'FuMa'
                     reason = 'override'
-                elif info_decider == 'keyword-ambix':
-                    chosen_kind = 'AmbiX'
-                    reason = 'keyword'
-                elif info_decider == 'keyword-fuma':
-                    chosen_kind = 'FuMa'
-                    reason = 'keyword'
                 else:
-                    # ambiguous/default
-                    if (ambi_default or 'fuma').lower() == 'ambix':
+                    # Try energy scan first when auto
+                    kind_scan, scan_info = _decide_ambix_fuma_by_energy(_compute_channel_rms(backup_path) or [])
+                    if kind_scan in ('AmbiX', 'FuMa'):
+                        chosen_kind = kind_scan
+                        reason = 'energy-scan'
+                    elif info_decider == 'keyword-ambix':
                         chosen_kind = 'AmbiX'
-                        reason = 'default-bias'
-                    else:
+                        reason = 'keyword'
+                    elif info_decider == 'keyword-fuma':
                         chosen_kind = 'FuMa'
-                        reason = 'default-bias'
+                        reason = 'keyword'
+                    else:
+                        # ambiguous/default bias
+                        if (ambi_default or 'ambix').lower() == 'ambix':
+                            chosen_kind = 'AmbiX'
+                            reason = 'default-bias'
+                        else:
+                            chosen_kind = 'FuMa'
+                            reason = 'default-bias'
                 roles = ambi_roles
                 tm = make_ambisonics_transform(roles, chosen_kind)
                 transform = tm
                 transform_name = f"ambisonics-{chosen_kind.lower()}"
-                detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': chosen_kind, 'info': ambi_info, 'decision': reason}}
+                notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': chosen_kind, 'info': ambi_info, 'decision': reason}}
+                # attach scan info if used
+                try:
+                    if 'scan_info' in locals() and isinstance(scan_info, dict):
+                        notes['ambisonics']['scan'] = scan_info
+                except Exception:
+                    pass
+                detection_notes = notes
             if transform is None:
                 mask = parse_wav_channel_mask(backup_path)
                 roles = roles_from_mask(mask, sfi.channels)
@@ -972,30 +1050,43 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             else:
                 detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
         elif ambi_roles:
-            # Allow override or default bias
+            # Allow override or default bias for ambiguous decisions, with optional energy scan
             ambi_kind_norm = (ambi_kind or 'auto').lower()
             info_decider = (ambi_info or {}).get('decider') if isinstance(ambi_info, dict) else None
             if ambi_kind_norm in ('fuma', 'ambix'):
                 chosen_kind = 'AmbiX' if ambi_kind_norm == 'ambix' else 'FuMa'
                 reason = 'override'
-            elif info_decider == 'keyword-ambix':
-                chosen_kind = 'AmbiX'
-                reason = 'keyword'
-            elif info_decider == 'keyword-fuma':
-                chosen_kind = 'FuMa'
-                reason = 'keyword'
             else:
-                if (ambi_default or 'fuma').lower() == 'ambix':
+                # Try energy scan first when auto
+                kind_scan, scan_info = _decide_ambix_fuma_by_energy(_compute_channel_rms(in_path) or [])
+                if kind_scan in ('AmbiX', 'FuMa'):
+                    chosen_kind = kind_scan
+                    reason = 'energy-scan'
+                elif info_decider == 'keyword-ambix':
                     chosen_kind = 'AmbiX'
-                    reason = 'default-bias'
-                else:
+                    reason = 'keyword'
+                elif info_decider == 'keyword-fuma':
                     chosen_kind = 'FuMa'
-                    reason = 'default-bias'
+                    reason = 'keyword'
+                else:
+                    # ambiguous/default bias → prefer AmbiX by default
+                    if (ambi_default or 'ambix').lower() == 'ambix':
+                        chosen_kind = 'AmbiX'
+                        reason = 'default-bias'
+                    else:
+                        chosen_kind = 'FuMa'
+                        reason = 'default-bias'
             roles = ambi_roles
             tm = make_ambisonics_transform(roles, chosen_kind)
             transform = tm
             transform_name = f"ambisonics-{chosen_kind.lower()}"
             detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': chosen_kind, 'info': ambi_info, 'decision': reason}}
+            # attach scan info if used
+            try:
+                if 'scan_info' in locals() and isinstance(scan_info, dict):
+                    detection_notes['ambisonics']['scan'] = scan_info
+            except Exception:
+                pass
         if transform is None:
             mask = parse_wav_channel_mask(in_path)
             roles = roles_from_mask(mask, ch)
@@ -1090,7 +1181,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--aformat-preset', choices=['generic'], default=None, help='If Ambisonics A-format is detected, use this preset 4x4 A→B matrix before decoding (experimental).')
     ap.add_argument('--aformat-matrix', type=Path, default=None, help='Path to JSON file containing a 4x4 A→B matrix (rows=W,X,Y,Z; cols=channels 1..4). Overrides --aformat-preset.')
     ap.add_argument('--ambisonics-kind', choices=['auto', 'fuma', 'ambix'], default='auto', help='Force Ambisonics B-format kind (auto/fuma/ambix).')
-    ap.add_argument('--ambisonics-default', choices=['fuma', 'ambix'], default='fuma', help='When auto detection is ambiguous, prefer this kind (default: fuma).')
+    ap.add_argument('--ambisonics-default', choices=['fuma', 'ambix'], default='ambix', help='When auto detection is ambiguous, prefer this kind (default: ambix).')
     ap.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v or -vv).')
 
     args = ap.parse_args(argv)
@@ -1183,11 +1274,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                         print(f"  Ambisonics: A-format detected based on: {', '.join(ev) if ev else 'indicators'}; no A→B provided — using non-ambisonic downmix fallback")
                 else:
                     reason_txt = ''
-                    if ambi.get('decision'):
-                        reason_txt = f" (decision: {ambi.get('decision')})"
+                    decision = ambi.get('decision')
+                    if decision:
+                        reason_txt = f" (decision: {decision})"
                     elif decider:
                         reason_txt = f" (detected by {decider})"
                     print(f"  Ambisonics: detected as {kind} based on: {', '.join(ev) if ev else 'unspecified indicators'}{reason_txt}")
+                    # If we decided via an energy scan or fell back to default-bias, explain why and show levels
+                    scan = ambi.get('scan') if isinstance(ambi.get('scan'), dict) else None
+                    if decision in ('energy-scan', 'default-bias'):
+                        if decision == 'energy-scan':
+                            print("    Not enough metadata to determine AmbiX vs FuMa; analyzed audio levels to decide.")
+                        elif decision == 'default-bias':
+                            print("    Metadata was ambiguous; no decisive keywords; using default preference (AmbiX by default).")
+                        if scan and isinstance(scan.get('rms'), (list, tuple)):
+                            rms = [float(x) for x in scan.get('rms')]
+                            # Compute dB per channel
+                            eps = 1e-12
+                            db = [20.0 * np.log10(x if x > eps else eps) for x in rms]
+                            ch_list = ', '.join([f"ch{i+1}={rms[i]:.6f} ({db[i]:+.1f} dB)" for i in range(len(rms))])
+                            print(f"    Energy scan RMS (first ~262k frames): {ch_list}")
+                            if 'min_index' in scan:
+                                mi = scan.get('min_index')
+                                conf = scan.get('confidence_db')
+                                print(f"    Lowest among channels 2..4: ch{mi} (confidence {conf:+.1f} dB) → selected {kind}.")
             # Friendly layout and downmix plan
             roles = src.get('roles')
             shown_layout = False
