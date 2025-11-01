@@ -390,6 +390,8 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
     hay = ' '.join([name] + tag_values)
     indicators: List[str] = []
     aformat: List[str] = []
+    ambix_hits: List[str] = []
+    fuma_hits: List[str] = []
     # filename indicators
     if 'ambisonic' in name:
         indicators.append("filename contains 'ambisonic'")
@@ -397,8 +399,16 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
         indicators.append("filename mentions 'B-Format'")
     if 'ambix' in name:
         indicators.append("filename contains 'ambix'")
+        ambix_hits.append("filename contains 'ambix'")
     if 'fuma' in name:
         indicators.append("filename contains 'fuma'")
+        fuma_hits.append("filename contains 'fuma'")
+    if 'acn' in name or 'sn3d' in name:
+        indicators.append("filename mentions 'ACN/SN3D'")
+        ambix_hits.append("filename mentions 'ACN/SN3D'")
+    if 'wxyz' in name:
+        indicators.append("filename mentions 'WXYZ'")
+        fuma_hits.append("filename mentions 'WXYZ'")
     if 'a format' in name or 'a-format' in name or 'aformat' in name:
         aformat.append("filename mentions 'A-Format'")
     # tag indicators
@@ -411,6 +421,10 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
             indicators.append(f"tag {k} contains '{vv}'")
         if any(t in vv for t in ['a format', 'a-format', 'aformat']):
             aformat.append(f"tag {k} contains '{vv}'")
+        if any(t in vv for t in ['ambix', 'acn', 'sn3d']):
+            ambix_hits.append(f"tag {k} contains '{vv}'")
+        if any(t in vv for t in ['fuma', 'wxyz']):
+            fuma_hits.append(f"tag {k} contains '{vv}'")
     is_ambi = bool(indicators or aformat)
     if not is_ambi:
         return None, None, None
@@ -423,16 +437,27 @@ def detect_ambisonics(path: Path, ch: int) -> Tuple[Optional[List[str]], Optiona
             'kind': None,
         }
         return None, None, info
-    # Else assume B-format; Decide FuMa vs AmbiX (ACN/SN3D) by keywords
+    # Else assume B-format; decide FuMa vs AmbiX (ACN/SN3D) by keywords
+    decider = 'default'
     kind = 'FuMa'
-    if 'ambix' in hay:
+    if ambix_hits and not fuma_hits:
         kind = 'AmbiX'
+        decider = 'keyword-ambix'
+    elif fuma_hits and not ambix_hits:
+        kind = 'FuMa'
+        decider = 'keyword-fuma'
+    else:
+        # ambiguous; leave default 'FuMa' unless caller biases
+        decider = 'ambiguous'
     roles = ['W', 'Y', 'Z', 'X'] if kind == 'AmbiX' else ['W', 'X', 'Y', 'Z']
     info = {
         'evidence': indicators,
         'tags_used': sorted(list(tags.keys())) if isinstance(tags, dict) else None,
         'format': 'B',
         'kind': kind,
+        'decider': decider,
+        'ambix_hits': ambix_hits,
+        'fuma_hits': fuma_hits,
     }
     return roles, kind, info
 
@@ -746,7 +771,9 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                  preserve_originals_subdir: Optional[str] = None,
                  verbose: int = 0,
                  aformat_preset: Optional[str] = None,
-                 aformat_matrix: Optional[Path] = None) -> Dict[str, Any]:
+                 aformat_matrix: Optional[Path] = None,
+                 ambi_kind: str = 'auto',
+                 ambi_default: str = 'fuma') -> Dict[str, Any]:
     """Downmix a single file.
 
     If preserve_originals_subdir is provided and the file has >=3 channels, the original file is moved to a
@@ -803,11 +830,34 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                     # No matrix -> leave transform None to fall back
                     detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
             elif ambi_roles:
+                # Allow override or default bias for ambiguous decisions
+                chosen_kind = ambi_kind
+                info_decider = (ambi_info or {}).get('decider') if isinstance(ambi_info, dict) else None
+                detected_kind = ambi_kind if ambi_kind in ('fuma', 'ambix') else (ambi_kind if ambi_kind in ('FuMa','AmbiX') else None)
+                # Normalize values
+                ambi_kind_norm = (ambi_kind or 'auto').lower()
+                if ambi_kind_norm in ('fuma', 'ambix'):
+                    chosen_kind = 'AmbiX' if ambi_kind_norm == 'ambix' else 'FuMa'
+                    reason = 'override'
+                elif info_decider == 'keyword-ambix':
+                    chosen_kind = 'AmbiX'
+                    reason = 'keyword'
+                elif info_decider == 'keyword-fuma':
+                    chosen_kind = 'FuMa'
+                    reason = 'keyword'
+                else:
+                    # ambiguous/default
+                    if (ambi_default or 'fuma').lower() == 'ambix':
+                        chosen_kind = 'AmbiX'
+                        reason = 'default-bias'
+                    else:
+                        chosen_kind = 'FuMa'
+                        reason = 'default-bias'
                 roles = ambi_roles
-                tm = make_ambisonics_transform(roles, ambi_kind)
+                tm = make_ambisonics_transform(roles, chosen_kind)
                 transform = tm
-                transform_name = f"ambisonics-{ambi_kind.lower()}"
-                detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': ambi_kind, 'info': ambi_info}}
+                transform_name = f"ambisonics-{chosen_kind.lower()}"
+                detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': chosen_kind, 'info': ambi_info, 'decision': reason}}
             if transform is None:
                 mask = parse_wav_channel_mask(backup_path)
                 roles = roles_from_mask(mask, sfi.channels)
@@ -922,11 +972,30 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             else:
                 detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
         elif ambi_roles:
+            # Allow override or default bias
+            ambi_kind_norm = (ambi_kind or 'auto').lower()
+            info_decider = (ambi_info or {}).get('decider') if isinstance(ambi_info, dict) else None
+            if ambi_kind_norm in ('fuma', 'ambix'):
+                chosen_kind = 'AmbiX' if ambi_kind_norm == 'ambix' else 'FuMa'
+                reason = 'override'
+            elif info_decider == 'keyword-ambix':
+                chosen_kind = 'AmbiX'
+                reason = 'keyword'
+            elif info_decider == 'keyword-fuma':
+                chosen_kind = 'FuMa'
+                reason = 'keyword'
+            else:
+                if (ambi_default or 'fuma').lower() == 'ambix':
+                    chosen_kind = 'AmbiX'
+                    reason = 'default-bias'
+                else:
+                    chosen_kind = 'FuMa'
+                    reason = 'default-bias'
             roles = ambi_roles
-            tm = make_ambisonics_transform(roles, ambi_kind)
+            tm = make_ambisonics_transform(roles, chosen_kind)
             transform = tm
-            transform_name = f"ambisonics-{ambi_kind.lower()}"
-            detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': ambi_kind, 'info': ambi_info}}
+            transform_name = f"ambisonics-{chosen_kind.lower()}"
+            detection_notes = {'ambisonics': {'detected': True, 'format': 'B', 'kind': chosen_kind, 'info': ambi_info, 'decision': reason}}
         if transform is None:
             mask = parse_wav_channel_mask(in_path)
             roles = roles_from_mask(mask, ch)
@@ -1020,6 +1089,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--chunk-size', type=int, default=262144, help='Frames per processing block (default: 262144).')
     ap.add_argument('--aformat-preset', choices=['generic'], default=None, help='If Ambisonics A-format is detected, use this preset 4x4 A→B matrix before decoding (experimental).')
     ap.add_argument('--aformat-matrix', type=Path, default=None, help='Path to JSON file containing a 4x4 A→B matrix (rows=W,X,Y,Z; cols=channels 1..4). Overrides --aformat-preset.')
+    ap.add_argument('--ambisonics-kind', choices=['auto', 'fuma', 'ambix'], default='auto', help='Force Ambisonics B-format kind (auto/fuma/ambix).')
+    ap.add_argument('--ambisonics-default', choices=['fuma', 'ambix'], default='fuma', help='When auto detection is ambiguous, prefer this kind (default: fuma).')
     ap.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v or -vv).')
 
     args = ap.parse_args(argv)
@@ -1070,6 +1141,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 verbose=args.verbose,
                 aformat_preset=args.aformat_preset,
                 aformat_matrix=args.aformat_matrix,
+                ambi_kind=args.ambisonics_kind,
+                ambi_default=args.ambisonics_default,
             )
         except Exception as e:
             res = {"path": str(fpath), "error": str(e)}
@@ -1098,7 +1171,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             if ambi and ambi.get('detected'):
                 fmt = ambi.get('format')
                 kind = ambi.get('kind')
-                ev = (ambi.get('info') or {}).get('evidence') or []
+                info = ambi.get('info') or {}
+                ev = info.get('evidence') or []
+                decider = info.get('decider')
                 if fmt == 'A':
                     ainfo = ambi.get('aformat') or {}
                     if ainfo.get('matrix') or ainfo.get('preset'):
@@ -1107,7 +1182,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     else:
                         print(f"  Ambisonics: A-format detected based on: {', '.join(ev) if ev else 'indicators'}; no A→B provided — using non-ambisonic downmix fallback")
                 else:
-                    print(f"  Ambisonics: detected as {kind} based on: {', '.join(ev) if ev else 'unspecified indicators'}")
+                    reason_txt = ''
+                    if ambi.get('decision'):
+                        reason_txt = f" (decision: {ambi.get('decision')})"
+                    elif decider:
+                        reason_txt = f" (detected by {decider})"
+                    print(f"  Ambisonics: detected as {kind} based on: {', '.join(ev) if ev else 'unspecified indicators'}{reason_txt}")
             # Friendly layout and downmix plan
             roles = src.get('roles')
             shown_layout = False
