@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import shutil
 import os
 from pathlib import Path
@@ -72,6 +73,112 @@ def _iter_paths(inputs: List[Path], recursive: bool) -> Iterable[Path]:
 # ---------- Downmix core ----------
 
 SQRT1_2 = 1 / np.sqrt(2.0)  # ~0.7071
+
+# Channel mask bits (WAVE_FORMAT_EXTENSIBLE / KSAUDIO_SPEAKER_*)
+CHAN_BITS = [
+    (0x00000001, 'FL'),
+    (0x00000002, 'FR'),
+    (0x00000004, 'FC'),
+    (0x00000008, 'LFE'),
+    (0x00000010, 'BL'),
+    (0x00000020, 'BR'),
+    (0x00000040, 'FLC'),
+    (0x00000080, 'FRC'),
+    (0x00000100, 'BC'),
+    (0x00000200, 'SL'),
+    (0x00000400, 'SR'),
+    (0x00000800, 'TC'),
+    (0x00001000, 'TFL'),
+    (0x00002000, 'TFC'),
+    (0x00004000, 'TFR'),
+    (0x00008000, 'TBL'),
+    (0x00010000, 'TBC'),
+    (0x00020000, 'TBR'),
+    (0x00040000, 'TSL'),
+    (0x00080000, 'TSR'),
+    (0x00100000, 'BLC'),
+    (0x00200000, 'BRC'),
+]
+
+
+def parse_wav_channel_mask(path: Path) -> Optional[int]:
+    """Return WAVEFORMATEXTENSIBLE dwChannelMask if present, else None."""
+    try:
+        with path.open('rb') as f:
+            if f.read(4) not in (b'RIFF', b'RF64'):
+                return None
+            _ = f.read(4)  # size
+            if f.read(4) != b'WAVE':
+                return None
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    return None
+                cid = hdr[:4]
+                csz = int.from_bytes(hdr[4:], 'little')
+                if cid == b'fmt ':
+                    data = f.read(csz)
+                    if len(data) < 18:
+                        return None
+                    fmt_tag = int.from_bytes(data[0:2], 'little')
+                    if fmt_tag == 0xFFFE and csz >= 40:  # WAVE_FORMAT_EXTENSIBLE
+                        # structure: WAVEFORMATEX (16) + wValidBitsPerSample(2) + dwChannelMask(4) + SubFormat(16)
+                        mask = int.from_bytes(data[20:24], 'little')
+                        return mask
+                    return None
+                # skip chunk + pad
+                f.seek(csz + (csz & 1), os.SEEK_CUR)
+    except Exception:
+        return None
+
+
+def make_mask_transform(mask: int, ch: int):
+    """Return a transform(block)->stereo using channel mask order if consistent with ch, else None."""
+    if mask is None:
+        return None
+    # Build ordered channel roles by standard mask bit order
+    roles = [name for (bit, name) in CHAN_BITS if (mask & bit)]
+    if len(roles) != ch:
+        # Inconsistent; cannot trust mask
+        return None
+
+    # Map role weights to L/R
+    def role_weights(role: str) -> Tuple[float, float]:
+        if role == 'FL':
+            return 1.0, 0.0
+        if role == 'FR':
+            return 0.0, 1.0
+        if role == 'FC' or role == 'TFC' or role == 'TC':
+            return SQRT1_2, SQRT1_2
+        if role == 'LFE':
+            return 0.5, 0.5
+        if role in ('BL', 'SL', 'TBL', 'TSL', 'BLC'):
+            return SQRT1_2, 0.0
+        if role in ('BR', 'SR', 'TBR', 'TSR', 'BRC'):
+            return 0.0, SQRT1_2
+        if role == 'BC':
+            return 0.5, 0.5
+        if role == 'FLC' or role == 'TFL':
+            return 0.5, 0.0
+        if role == 'FRC' or role == 'TFR':
+            return 0.0, 0.5
+        # default gentle spread
+        return 0.5, 0.5
+
+    # Precompute indices and weights
+    idxs = list(range(ch))
+    lw = np.array([role_weights(r)[0] for r in roles], dtype=np.float32)
+    rw = np.array([role_weights(r)[1] for r in roles], dtype=np.float32)
+
+    def transform(block: np.ndarray) -> np.ndarray:
+        if block.ndim != 2 or block.shape[1] != ch:
+            raise ValueError('Unexpected block shape for mask-based transform')
+        b = block.astype(np.float32, copy=False)
+        L = np.sum(b * lw[None, :], axis=1)
+        R = np.sum(b * rw[None, :], axis=1)
+        return np.stack([L, R], axis=1)
+
+    return transform
 
 def downmix_block(block: np.ndarray) -> np.ndarray:
     """
@@ -198,6 +305,30 @@ def _write_streamed(sfi: sf.SoundFile, out_path: Path, subtype: str, chunk_size:
             sfo.write(out)
 
 
+def _ffmpeg_path() -> Optional[str]:
+    exe = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+    return exe
+
+
+def _copy_metadata_with_ffmpeg(dst_audio: Path, src_meta: Path) -> Optional[str]:
+    """Copy metadata from src_meta to dst_audio in place using ffmpeg remux. Returns error string if failed, else None."""
+    ff = _ffmpeg_path()
+    if not ff:
+        return 'ffmpeg not found; metadata not preserved'
+    tmp_out = dst_audio.with_suffix('.tmp.wav')
+    cmd = [ff, '-v', 'error', '-y', '-i', str(dst_audio), '-i', str(src_meta), '-map', '0:a', '-map_metadata', '1', '-c', 'copy', str(tmp_out)]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if r.returncode != 0 or (not tmp_out.exists()):
+            return f'ffmpeg metadata copy failed: {r.stderr.decode(errors="ignore").strip()}'
+        # Replace original
+        dst_audio.unlink(missing_ok=True)
+        tmp_out.replace(dst_audio)
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite: bool,
                  subtype: Optional[str], normalize: bool, chunk_size: int,
                  preserve_originals_subdir: Optional[str] = None) -> Dict[str, Any]:
@@ -233,7 +364,9 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             # Determine output subtype: preserve unless explicitly set
             out_subtype = subtype or sfi.subtype or 'PCM_16'
             # Choose transform
-            transform = (lambda x: x) if sfi.channels == 2 else downmix_block
+            # Prefer mask-based transform if available
+            mask = parse_wav_channel_mask(backup_path)
+            transform = (lambda x: x) if sfi.channels == 2 else (make_mask_transform(mask, sfi.channels) or downmix_block)
             # Normalize using global peak if requested
             if normalize:
                 peak = _compute_peak(backup_path, chunk_size=chunk_size, transform=transform)
@@ -243,7 +376,11 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             else:
                 _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=1.0)
 
-        return {"path": str(in_path), "out": str(out_path), "backup": str(backup_path), "sr": sr, "in_channels": ch, "out_channels": 2}
+        meta_err = _copy_metadata_with_ffmpeg(out_path, backup_path)
+        result = {"path": str(in_path), "out": str(out_path), "backup": str(backup_path), "sr": sr, "in_channels": ch, "out_channels": 2}
+        if meta_err:
+            result["metadata_warning"] = meta_err
+        return result
 
     # Not preserving originals: write to side-by-side output
     out_dir = out_dir or in_path.parent
@@ -254,7 +391,8 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
 
     with sf.SoundFile(str(in_path), mode='r') as sfi:
         out_subtype = subtype or sfi.subtype or 'PCM_16'
-        transform = (lambda x: x) if ch == 2 else downmix_block
+        mask = parse_wav_channel_mask(in_path)
+        transform = (lambda x: x) if ch == 2 else (make_mask_transform(mask, ch) or downmix_block)
         if normalize:
             peak = _compute_peak(in_path, chunk_size=chunk_size, transform=transform)
             scale = (1.0 / peak) if peak > 1.0 else 1.0
@@ -262,7 +400,11 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         else:
             scale = 1.0
         _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=scale)
-        return {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        meta_err = _copy_metadata_with_ffmpeg(out_path, in_path)
+        result = {"path": str(in_path), "out": str(out_path), "sr": sfi.samplerate, "in_channels": ch, "out_channels": 2}
+        if meta_err:
+            result["metadata_warning"] = meta_err
+        return result
 
 # ---------- CLI ----------
 
