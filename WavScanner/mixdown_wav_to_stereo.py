@@ -76,28 +76,28 @@ SQRT1_2 = 1 / np.sqrt(2.0)  # ~0.7071
 
 # Channel mask bits (WAVE_FORMAT_EXTENSIBLE / KSAUDIO_SPEAKER_*)
 CHAN_BITS = [
-    (0x00000001, 'FL'),
-    (0x00000002, 'FR'),
-    (0x00000004, 'FC'),
-    (0x00000008, 'LFE'),
-    (0x00000010, 'BL'),
-    (0x00000020, 'BR'),
-    (0x00000040, 'FLC'),
-    (0x00000080, 'FRC'),
-    (0x00000100, 'BC'),
-    (0x00000200, 'SL'),
-    (0x00000400, 'SR'),
-    (0x00000800, 'TC'),
-    (0x00001000, 'TFL'),
-    (0x00002000, 'TFC'),
-    (0x00004000, 'TFR'),
-    (0x00008000, 'TBL'),
-    (0x00010000, 'TBC'),
-    (0x00020000, 'TBR'),
-    (0x00040000, 'TSL'),
-    (0x00080000, 'TSR'),
-    (0x00100000, 'BLC'),
-    (0x00200000, 'BRC'),
+    (0x00000001, 'FL'),  # Front Left
+    (0x00000002, 'FR'),  # Front Right
+    (0x00000004, 'FC'),  # Front Center
+    (0x00000008, 'LFE'), # Low-Frequency Effects
+    (0x00000010, 'BL'),  # Back Left
+    (0x00000020, 'BR'),  # Back Right
+    (0x00000040, 'FLC'), # Front Left of Center
+    (0x00000080, 'FRC'), # Front Right of Center
+    (0x00000100, 'BC'),  # Back Center
+    (0x00000200, 'SL'),  # Side Left
+    (0x00000400, 'SR'),  # Side Right
+    (0x00000800, 'TC'),  # Top Center
+    (0x00001000, 'TFL'), # Top Front Left
+    (0x00002000, 'TFC'), # Top Front Center
+    (0x00004000, 'TFR'), # Top Front Right
+    (0x00008000, 'TBL'), # Top Back Left
+    (0x00010000, 'TBC'), # Top Back Center
+    (0x00020000, 'TBR'), # Top Back Right
+    (0x00040000, 'TSL'), # Top Side Left
+    (0x00080000, 'TSR'), # Top Side Right
+    (0x00100000, 'BLC'), # Bottom Left of Center
+    (0x00200000, 'BRC'), # Bottom Right of Center
 ]
 
 
@@ -179,6 +179,84 @@ def make_mask_transform(mask: int, ch: int):
         return np.stack([L, R], axis=1)
 
     return transform
+
+
+FRIENDLY_ROLE = {
+    'FL': 'Front Left',
+    'FR': 'Front Right',
+    'FC': 'Front Center',
+    'LFE': 'LFE (subwoofer)',
+    'BL': 'Back Left',
+    'BR': 'Back Right',
+    'FLC': 'Front Left of Center',
+    'FRC': 'Front Right of Center',
+    'BC': 'Back Center',
+    'SL': 'Side Left',
+    'SR': 'Side Right',
+    'TC': 'Top Center',
+    'TFL': 'Top Front Left',
+    'TFC': 'Top Front Center',
+    'TFR': 'Top Front Right',
+    'TBL': 'Top Back Left',
+    'TBC': 'Top Back Center',
+    'TBR': 'Top Back Right',
+    'TSL': 'Top Side Left',
+    'TSR': 'Top Side Right',
+    'BLC': 'Bottom Left of Center',
+    'BRC': 'Bottom Right of Center',
+}
+
+
+def roles_from_mask(mask: Optional[int], ch: int) -> Optional[List[str]]:
+    if mask is None:
+        return None
+    roles = [name for (bit, name) in CHAN_BITS if (mask & bit)]
+    if len(roles) != ch:
+        return None
+    return roles
+
+
+def friendly_mask_list(mask: Optional[int], ch: int) -> Optional[str]:
+    roles = roles_from_mask(mask, ch)
+    if not roles:
+        return None
+    return ", ".join(f"{FRIENDLY_ROLE.get(r, r)} ({r})" for r in roles)
+
+
+def describe_downmix_from_roles(roles: List[str]) -> Tuple[str, str]:
+    """Return (left_desc, right_desc) describing contributions with dB weights."""
+    def role_weight_db_to_side(role: str, side: str) -> Optional[float]:
+        # Convert weights used in make_mask_transform to dB text
+        if role == 'FL' and side == 'L':
+            return 0.0
+        if role == 'FR' and side == 'R':
+            return 0.0
+        if role in ('FC', 'TFC', 'TC'):
+            return -3.0
+        if role == 'LFE':
+            return -6.0
+        if role in ('BL', 'SL', 'TBL', 'TSL', 'BLC') and side == 'L':
+            return -3.0
+        if role in ('BR', 'SR', 'TBR', 'TSR', 'BRC') and side == 'R':
+            return -3.0
+        if role == 'FLC' and side == 'L':
+            return -6.0
+        if role == 'FRC' and side == 'R':
+            return -6.0
+        if role == 'BC':
+            return -6.0
+        return None
+
+    left_parts = []
+    right_parts = []
+    for r in roles:
+        dbL = role_weight_db_to_side(r, 'L')
+        if dbL is not None:
+            left_parts.append(f"{FRIENDLY_ROLE.get(r, r)} ({r}, {dbL:+.1f} dB)")
+        dbR = role_weight_db_to_side(r, 'R')
+        if dbR is not None:
+            right_parts.append(f"{FRIENDLY_ROLE.get(r, r)} ({r}, {dbR:+.1f} dB)")
+    return ", ".join(left_parts) or "(none)", ", ".join(right_parts) or "(none)"
 
 def downmix_block(block: np.ndarray) -> np.ndarray:
     """
@@ -329,6 +407,33 @@ def _copy_metadata_with_ffmpeg(dst_audio: Path, src_meta: Path) -> Optional[str]
         return str(e)
 
 
+def _ffmpeg_apply_metadata(dst_audio: Path, tags: Dict[str, Any]) -> Optional[str]:
+    """Apply tags onto dst_audio by remuxing and setting -metadata key=value pairs. Returns error string or None."""
+    ff = _ffmpeg_path()
+    if not ff:
+        return 'ffmpeg not found; metadata not preserved'
+    tmp_out = dst_audio.with_suffix('.tmp2.wav')
+    cmd = [ff, '-v', 'error', '-y', '-i', str(dst_audio), '-map', '0:a', '-map_metadata', '-1', '-c', 'copy']
+    for k, v in (tags or {}).items():
+        # Flatten values to strings
+        if v is None:
+            continue
+        sval = str(v)
+        # Avoid newlines that can confuse shells
+        sval = sval.replace('\r', ' ').replace('\n', '  ')
+        cmd.extend(['-metadata', f"{k}={sval}"])
+    cmd.append(str(tmp_out))
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if r.returncode != 0 or (not tmp_out.exists()):
+            return f'ffmpeg metadata apply failed: {r.stderr.decode(errors="ignore").strip()}'
+        dst_audio.unlink(missing_ok=True)
+        tmp_out.replace(dst_audio)
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def _ffprobe_path() -> Optional[str]:
     exe = shutil.which('ffprobe') or shutil.which('ffprobe.exe')
     return exe
@@ -426,6 +531,15 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         # Metadata copy (post-write)
         meta_before = _ffprobe_tags(backup_path) if verbose >= 2 else None
         meta_err = _copy_metadata_with_ffmpeg(out_path, backup_path)
+        # If simple copy missed keys, try explicit apply from source tags
+        if meta_err is None and verbose >= 2:
+            after_try = _ffprobe_tags(out_path)
+            if isinstance(meta_before, dict) and isinstance(after_try, dict):
+                missing = [k for k in meta_before.keys() if k not in after_try]
+                if missing:
+                    meta_err2 = _ffmpeg_apply_metadata(out_path, meta_before)
+                    if meta_err2:
+                        meta_err = meta_err2
         meta_after = _ffprobe_tags(out_path) if verbose >= 2 else None
 
         bits_in = _bits_for_subtype(sfi.subtype)
@@ -488,6 +602,14 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
         _write_streamed(sfi, out_path, subtype=out_subtype, chunk_size=chunk_size, transform=transform, scale=scale)
         meta_before = _ffprobe_tags(in_path) if verbose >= 2 else None
         meta_err = _copy_metadata_with_ffmpeg(out_path, in_path)
+        if meta_err is None and verbose >= 2:
+            after_try = _ffprobe_tags(out_path)
+            if isinstance(meta_before, dict) and isinstance(after_try, dict):
+                missing = [k for k in meta_before.keys() if k not in after_try]
+                if missing:
+                    meta_err2 = _ffmpeg_apply_metadata(out_path, meta_before)
+                    if meta_err2:
+                        meta_err = meta_err2
         meta_after = _ffprobe_tags(out_path) if verbose >= 2 else None
         bits_in = _bits_for_subtype(sfi.subtype)
         bits_out = _bits_for_subtype(out_subtype)
@@ -610,13 +732,46 @@ def main(argv: Optional[List[str]] = None) -> int:
             d = r['details']
             src = d.get('source', {})
             dst = d.get('dest', {})
-            print(f"  src: channels={src.get('channels')} sr={src.get('samplerate')} subtype={src.get('subtype')} bits={src.get('bits')} mask={src.get('mask')}")
-            print(f"  dst: subtype={dst.get('subtype')} bits={dst.get('bits')} transform={dst.get('transform')} normalize={dst.get('normalize')} scale={dst.get('scale')}")
+            print(f"  Original: {src.get('channels')} channels @ {src.get('samplerate')} Hz, {src.get('subtype')} ({src.get('bits')}‑bit)")
+            mask_str = friendly_mask_list(mask=None, ch=0)  # placeholder; we'll compute below
+            # Recompute friendly mask for printing, using available info
+            src_mask = src.get('mask')
+            if isinstance(src_mask, str) and src_mask.startswith('0x'):
+                try:
+                    src_mask_int = int(src_mask, 16)
+                except Exception:
+                    src_mask_int = None
+            else:
+                src_mask_int = None
+            roles = roles_from_mask(src_mask_int, src.get('channels') or 0) if src_mask_int is not None else None
+            if roles:
+                print(f"  Channel layout (from file): {friendly_mask_list(src_mask_int, src.get('channels'))}")
+                left_desc, right_desc = describe_downmix_from_roles(roles)
+                print(f"  Downmix plan → Left:  {left_desc}")
+                print(f"                 Right: {right_desc}")
+            else:
+                print(f"  Channel layout: not signaled (using common-layout heuristics)")
+            norm_txt = f"on (scale {dst.get('scale'):.3f})" if dst.get('normalize') else "off"
+            print(f"  Output: stereo, {dst.get('subtype')} ({dst.get('bits')}‑bit), transform: {dst.get('transform')}, normalization: {norm_txt}")
             if args.verbose >= 2 and d.get('metadata'):
                 md = d['metadata']
-                print(f"  metadata: ffmpeg={md.get('ffmpeg')} ffprobe={md.get('ffprobe')}")
-                print(f"  metadata keys before: {md.get('before_keys')}")
-                print(f"  metadata keys after:  {md.get('after_keys')}")
+                print(f"  Metadata propagation via ffmpeg: {'yes' if md.get('ffmpeg') else 'no'}; ffprobe available: {'yes' if md.get('ffprobe') else 'no'}")
+                before = r.get('details', {}).get('metadata', {})
+                # Show each key before with value and whether propagated
+                before_keys = before.get('before_keys')
+                after_keys = before.get('after_keys')
+                # Re-probe full tags for values
+                src_tags = _ffprobe_tags(Path(r['path'])) or {}
+                dst_tags = _ffprobe_tags(Path(r['out'])) or {}
+                for k in sorted(src_tags.keys()):
+                    v_before = src_tags.get(k)
+                    v_after = dst_tags.get(k)
+                    if v_after is None:
+                        print(f"    [missing] {k}: {v_before}")
+                    elif str(v_after) == str(v_before):
+                        print(f"    [propagated] {k}: {v_after}")
+                    else:
+                        print(f"    [changed] {k}: before='{v_before}' after='{v_after}'")
 
     # If any metadata could not be preserved, print guidance on ffmpeg setup
     if any(r.get('metadata_warning') for r in results):

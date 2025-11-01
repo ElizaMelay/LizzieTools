@@ -95,13 +95,15 @@ ffmpeg -version
 ffprobe -version
 ```
 
-Once installed, rerun the mixdown. For debugging, use verbosity flags:
+Once installed, rerun the mixdown. For debugging, use verbosity flags and get human-friendly explanations:
 
 ```powershell
-# -v: show parsed args interpretation and per-file basics (channels, subtype in->out, transform used)
+# -v: Friendly per-file summary (channels and sample rate; input subtype -> output subtype; whether channel mask used;
+#     transform selected; normalization and scale)
 C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r -v
 
-# -vv: add internals (WAVEFORMATEXTENSIBLE mask details, metadata keys before/after copy)
+# -vv: Deeper internals. Shows WAVEFORMATEXTENSIBLE mask as human-readable layout and the downmix plan (with dB weights).
+#      Lists every metadata key found with its value and whether it was propagated, changed, or missing after copy.
 C:/LizzieTools/WavScanner/.venv/Scripts/python.exe .\mixdown_wav_to_stereo.py C:\Path\To\Wavs -r -vv
 ```
 
