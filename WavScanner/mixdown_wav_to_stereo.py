@@ -872,7 +872,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
             out_subtype = subtype or sfi.subtype or 'PCM_16'
             # Choose transform
             # Prefer Ambisonics first (bias)
-            ambi_roles, ambi_kind, ambi_info = detect_ambisonics(backup_path, sfi.channels)
+            ambi_roles, ambi_detected_kind, ambi_info = detect_ambisonics(backup_path, sfi.channels)
             detection_notes: Optional[Dict[str, Any]] = None
             layout = None
             mask = None
@@ -896,9 +896,8 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
                     detection_notes = {'ambisonics': {'detected': True, 'format': 'A', 'kind': None, 'info': ambi_info, 'warning': 'A-format requires mic-specific A→B; provide --aformat-preset generic or --aformat-matrix'}}
             elif ambi_roles:
                 # Allow override or default bias for ambiguous decisions, with optional energy scan
-                chosen_kind = ambi_kind
+                chosen_kind = None
                 info_decider = (ambi_info or {}).get('decider') if isinstance(ambi_info, dict) else None
-                detected_kind = ambi_kind if ambi_kind in ('fuma', 'ambix') else (ambi_kind if ambi_kind in ('FuMa','AmbiX') else None)
                 # Normalize values
                 ambi_kind_norm = (ambi_kind or 'auto').lower()
                 if ambi_kind_norm in ('fuma', 'ambix'):
@@ -1029,7 +1028,7 @@ def mixdown_file(in_path: Path, out_dir: Optional[Path], suffix: str, overwrite:
     with sf.SoundFile(str(in_path), mode='r') as sfi:
         out_subtype = subtype or sfi.subtype or 'PCM_16'
         # Prefer Ambisonics first (bias)
-        ambi_roles, ambi_kind, ambi_info = detect_ambisonics(in_path, ch)
+        ambi_roles, ambi_detected_kind, ambi_info = detect_ambisonics(in_path, ch)
         detection_notes: Optional[Dict[str, Any]] = None
         layout = None
         mask = None
